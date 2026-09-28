@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 
 // #include <bluetooth/bluetooth.h>
 // #include <bluetooth/rfcomm.h>
@@ -21,6 +22,8 @@
 #include <netdb.h>            // 호스트 이름 조회
 // #include <bluetooth/sdp.h>    // SPP 서비스 검색·등록
 // #include <bluetooth/sdp_lib.h>
+#include <dirent.h>
+#include "file_util.h"
 
 #define MAX_LISTEN 5
 
@@ -37,11 +40,52 @@ static void handle_sigint(int signo){
     }
 }
 
+int8_t get_files(char files[],const size_t MAX_FILE_STR_SIZE,const char *dirname){
+    DIR *dir = opendir(dirname); 
+    if(dir==NULL){
+        perror("failed to open download directory");
+        return 1;
+    }
+    size_t files_len = strlen(files);
+    struct dirent *entry;
+    while((entry=readdir(dir))!=NULL){
+        struct stat st;
+        if(fstatat(dirfd(dir),entry->d_name,&st,AT_SYMLINK_NOFOLLOW)<-1){
+            fprintf(stderr,"failed to load file info\n");
+            continue;
+        }
+        if(S_ISREG(st.st_mode)){
+            fprintf(stdout,"file name : %s\n",entry->d_name);
+            if(files_len+strlen(entry->d_name)+1<MAX_FILE_STR_SIZE){
+                strcat(files,entry->d_name);
+                files[strlen(files)]=',';
+                files_len = strlen(files);
+            }else{
+                break;
+            }
+        }
+    }
+    files[files_len]='\0';
+    printf("files : %s\n",files);
+    printf("files str len %zd\n",files_len);
+    closedir(dir);
+    return 0;
+}
+
 void* TCP_control_thread(void*data){
     TCP_control_thread_params_t *param_data = (TCP_control_thread_params_t *)data;
     char *cli_ip = inet_ntoa(param_data->cli_info.sin_addr);
     fprintf(stdout,"%s connected\n",cli_ip);
     fprintf(stdout,"client socket number: %d\n",param_data->cli_sock);
+    const char *file_dir = "./files";
+    char files[MAX_FILE_NAME*MAX_FILE_NUMBER];
+    if(get_files(files,(const size_t)sizeof(files),file_dir)){
+        perror("failed to get file list\n");
+        close(param_data->cli_sock);
+        free(data);
+        param_data=NULL;
+        return NULL;
+    }
     close(param_data->cli_sock);
     free(data);
     param_data=NULL;
