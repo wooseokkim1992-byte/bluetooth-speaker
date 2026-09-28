@@ -4,6 +4,7 @@
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -46,28 +47,29 @@ int8_t get_files(char files[],const size_t MAX_FILE_STR_SIZE,const char *dirname
         perror("failed to open download directory");
         return 1;
     }
-    size_t files_len = strlen(files);
+    size_t files_len = 0;
     struct dirent *entry;
+    files[0]='\0';
     while((entry=readdir(dir))!=NULL){
         struct stat st;
-        if(fstatat(dirfd(dir),entry->d_name,&st,AT_SYMLINK_NOFOLLOW)<-1){
+        if(fstatat(dirfd(dir),entry->d_name,&st,AT_SYMLINK_NOFOLLOW)<=-1){
             fprintf(stderr,"failed to load file info\n");
             continue;
         }
         if(S_ISREG(st.st_mode)){
             fprintf(stdout,"file name : %s\n",entry->d_name);
-            if(files_len+strlen(entry->d_name)+1<MAX_FILE_STR_SIZE){
+
+            if(files_len+strlen(entry->d_name)+2<MAX_FILE_STR_SIZE){
+                files_len += strlen(entry->d_name);
                 strcat(files,entry->d_name);
-                files[strlen(files)]=',';
-                files_len = strlen(files);
+                files[files_len++]=',';
+                files[files_len]='\0';
             }else{
                 break;
             }
         }
     }
-    files[files_len]='\0';
-    printf("files : %s\n",files);
-    printf("files str len %zd\n",files_len);
+    if(files_len > 0) files[files_len-1]='\0';
     closedir(dir);
     return 0;
 }
@@ -86,10 +88,70 @@ void* TCP_control_thread(void*data){
         param_data=NULL;
         return NULL;
     }
+    int file_str_len = strlen(files);
+    printf("files : %s\n",files);
+    printf("files str len %d\n",file_str_len);
+    if(send_initial_files_info(files,file_str_len,param_data->cli_sock)){
+        perror("failed to send file list\n");
+        close(param_data->cli_sock);
+        free(data);
+        param_data=NULL;
+        return NULL;
+    }
     close(param_data->cli_sock);
     free(data);
     param_data=NULL;
     return NULL;
+}
+
+ssize_t write_all(int fd, const void *buf, size_t total){
+    if(total > SSIZE_MAX){
+        errno = EOVERFLOW;
+        return -1;
+    }
+    const unsigned char *bytes = buf;
+    size_t offset = 0;
+
+    while(offset < total){
+        ssize_t written = write(fd, bytes + offset, total - offset);
+        if(written > 0){
+            offset += (size_t)written;
+        }else if(written < 0 && errno == EINTR){
+            continue;
+        }else{
+            if(written == 0) errno = EIO;
+            return -1;
+        }
+    }
+    return (ssize_t)offset;
+}
+
+
+int8_t send_file_str_len(const int file_str_len,int cli_sock){
+    if(file_str_len < 0) return 1;
+    uint32_t network_byte = htonl((uint32_t)file_str_len);
+    if(write_all(cli_sock, &network_byte, sizeof(network_byte)) != (ssize_t)sizeof(network_byte)){
+        return 1;
+    }
+    return 0;
+}
+
+int8_t send_file_list(const char files[],const int file_str_len,int cli_sock){
+    if(file_str_len < 0) return 1;
+    if(write_all(cli_sock, files, (size_t)file_str_len) != (ssize_t)file_str_len){
+        return 1;
+    }
+    return 0;
+}
+
+int8_t send_initial_files_info(const char files[],const int file_str_len,int cli_sock){
+    if(send_file_str_len(file_str_len,cli_sock)){
+        return 1;
+    }
+    if(send_file_list(files,file_str_len,cli_sock)){
+        return 1;
+    }
+    return 0;
 }
 
 int main(int argc, const char*argv[]){
