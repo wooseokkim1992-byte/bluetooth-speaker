@@ -27,6 +27,7 @@ typedef struct _TCP_control_thread_params_t{
 static void* TCP_control_thread(void*data){
     TCP_control_thread_params_t *param_data = (TCP_control_thread_params_t *)data;
     char *cli_ip = inet_ntoa(param_data->cli_info.sin_addr);
+    int cli_sock = param_data->cli_sock;
     fprintf(stdout,"%s connected\n",cli_ip);
     fprintf(stdout,"client socket number: %d\n",param_data->cli_sock);
     const char *file_dir = "./files";
@@ -48,6 +49,13 @@ static void* TCP_control_thread(void*data){
         param_data=NULL;
         return NULL;
     }
+    //epoll 설정
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_struct ev = {0,};
+    ev.event = EPOLLIN|EPOLLERR|EPOLLHUP|EPOLLRDHUP;
+    ev.data.fd = cli_sock;
+    epoll_ctl(epfd,EPOL_CTL_ADD,cli_sock,&ev);
+
     close(param_data->cli_sock);
     free(data);
     param_data=NULL;
