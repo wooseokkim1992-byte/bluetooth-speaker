@@ -3,3 +3,4 @@ server
 *.o
 *.exe
 *.dSYM
+/build/
