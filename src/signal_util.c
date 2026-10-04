@@ -3,7 +3,7 @@
 #include <signal.h>
 #include <string.h>
 
-static volatile sig_atomic_t stop_flag = 0;
+volatile sig_atomic_t stop_flag = 0;
 
 static void handle_sigint(int signo){
     if(signo==SIGINT){

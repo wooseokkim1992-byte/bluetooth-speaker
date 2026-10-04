@@ -10,56 +10,104 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/epoll.h>
+#include <errno.h>
 
 #include "file_util.h"
 #include "signal_util.h"
 #include "tcp_interface.h"
-
-#define MAX_LISTEN 5
+#define MAX_LISTEN 10
+#define MAX_EPOLL 10
 
 typedef struct _TCP_control_thread_params_t{
-    struct sockaddr_in cli_info;
-    int cli_sock;
+    int server_fd;
+    int event_fd;
 }TCP_control_thread_params_t;
 
+static void* TCP_control_thread(void*param){
+    TCP_control_thread_params_t*data = (TCP_control_thread_params_t*)param;
+    int server_fd = data->server_fd;
+    int event_fd= data->event_fd;
+    struct sockaddr_in cli_addr_in={0,};
+    socklen_t cli_addr_len = sizeof(cli_addr_in);
 
+    int epoll_fd = epoll_create1(0);
+    if(epoll_fd<0){
+        fprintf(stderr,"failed to create epool");
+    }else{
+        struct epoll_event serv_ev;
+        serv_ev.events=EPOLLIN | EPOLLRDHUP| EPOLLERR;
+        serv_ev.data.fd = server_fd;
+        if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,server_fd,&serv_ev)<0){
+            perror("Failed to register epoll.\n");
+            close(epoll_fd);
+            free(param);
+            data=NULL;
+            return NULL;
+        }
+        struct epoll_event event_ev;
+        event_ev.events=  EPOLLIN | EPOLLRDHUP| EPOLLERR;
+        event_ev.data.fd = event_fd;
+        if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,event_fd,&event_ev)<0){
+            perror("Failed to register epoll.\n");
+            close(epoll_fd);
+            free(param);
+            data=NULL;
+            return NULL;
+        }
+        
+        struct epoll_event evt_list[MAX_EPOLL+2];
 
-static void* TCP_control_thread(void*data){
-    TCP_control_thread_params_t *param_data = (TCP_control_thread_params_t *)data;
-    char *cli_ip = inet_ntoa(param_data->cli_info.sin_addr);
-    int cli_sock = param_data->cli_sock;
-    fprintf(stdout,"%s connected\n",cli_ip);
-    fprintf(stdout,"client socket number: %d\n",param_data->cli_sock);
-    const char *file_dir = "./files";
-    char files[MAX_FILE_NAME*MAX_FILE_NUMBER];
-    if(get_files(files,(const size_t)sizeof(files),file_dir)){
-        perror("failed to get file list\n");
-        close(param_data->cli_sock);
-        free(data);
-        param_data=NULL;
-        return NULL;
+        while(1){
+            int evt_cnt = epoll_wait(epoll_fd,evt_list,MAX_EPOLL+2,-1);
+            if(evt_cnt<0){
+                if(errno==EINTR)continue;
+                break;
+            }
+            int8_t break_flag=0;
+            for(int8_t i =0;i<evt_cnt;i++){
+                if(evt_list[i].data.fd==server_fd){
+                    if(evt_list[i].events&EPOLLIN){
+                        memset(&cli_addr_in,0,sizeof(cli_addr_in));
+                        int cli_sock = accept(server_fd,(struct sockaddr*)&cli_addr_in,&cli_addr_len);
+                        if(cli_sock>=0){
+                            char ip[16];
+                            if(inet_ntop(AF_INET,&cli_addr_in.sin_addr,ip,sizeof(ip))!=NULL){
+                                fprintf(stdout,"ip:%s connected!\n",ip);
+                            }
+                            struct epoll_event cli_evt;
+                            cli_evt.events = EPOLLIN|EPOLLHUP|EPOLLERR|EPOLLRDHUP;
+                            cli_evt.data.fd = cli_sock;
+                            if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,cli_sock,&cli_evt)>=0){
+                                puts("client registered\n");
+                            }
+                        }
+                    }else{
+                        epoll_ctl(epoll_fd,EPOLL_CTL_DEL,server_fd,&evt_list[i]);
+                        perror("main socket problem\n");
+                        break_flag=1;
+                    }
+                }else if(evt_list[i].data.fd==event_fd){
+                    if(evt_list[i].events&EPOLLIN){
+                        puts("Interrupt Signal Detected\n");
+                        break_flag=1;
+                        break;
+                    }
+                }else{
+                    if(evt_list[i].events&(EPOLLHUP|EPOLLERR|EPOLLRDHUP)){
+                        puts("connection closed");
+                        epoll_ctl(epoll_fd,EPOLL_CTL_DEL,evt_list[i].data.fd,&evt_list[i]);
+                    }else if(evt_list[i].events&EPOLLIN){}
+                    
+                }
+            }
+            if(break_flag)break;
+        }
     }
-    int file_str_len = strlen(files);
-    printf("files : %s\n",files);
-    printf("files str len %d\n",file_str_len);
-    if(send_initial_files_info(files,file_str_len,param_data->cli_sock)){
-        perror("failed to send file list\n");
-        close(param_data->cli_sock);
-        free(data);
-        param_data=NULL;
-        return NULL;
-    }
-    //epoll 설정
-    int epfd = epoll_create1(EPOLL_CLOEXEC);
-    struct epoll_struct ev = {0,};
-    ev.event = EPOLLIN|EPOLLERR|EPOLLHUP|EPOLLRDHUP;
-    ev.data.fd = cli_sock;
-    epoll_ctl(epfd,EPOL_CTL_ADD,cli_sock,&ev);
-
-    close(param_data->cli_sock);
-    free(data);
-    param_data=NULL;
-    return NULL;
+    close(epoll_fd);
+    free(param);
+    data=NULL;
+    return NULL;   
 }
 
 ssize_t write_all(int fd, const void *buf, size_t total){
@@ -139,39 +187,22 @@ int tcp_open_listener(int port)
     return serv_sock;
 }
 
-void tcp_accept_loop(int serv_sock)
+int tcp_accept_loop(int serv_sock, int event_fd, pthread_t *out_thread)
 {
-    struct sockaddr_in cli_addr;
-    while(1){
-        int cli_sock;
-        socklen_t clnt_addr_size=sizeof(cli_addr);
-        if((cli_sock=accept(serv_sock,(struct sockaddr*)&cli_addr,&clnt_addr_size))==-1){
-            perror("failed to create connection");
-            if(errno!=EINTR)continue;
-            else {
-                if(is_stop_requested()){
-                    perror("SIGINT\n");
-                    break;
-                }
-                continue;
-            }
-        }
-        
-        pthread_t pid;
-        TCP_control_thread_params_t *input_data=malloc(sizeof(TCP_control_thread_params_t));
-        if(!input_data){
-            perror("failed to allocate data");
-            close(cli_sock);
-            continue;
-        }
-        input_data->cli_sock = cli_sock;
-        input_data->cli_info = cli_addr;
-        if(pthread_create(&pid,NULL,TCP_control_thread,(void*)input_data)!=0){
-            perror("failed to create TCP Control Thread\n");
-            close(cli_sock);
-            free(input_data);
-        }else{
-            pthread_detach(pid);
-        }
+    if(out_thread == NULL){
+        return EINVAL;
     }
+    TCP_control_thread_params_t* params;
+    params = malloc(sizeof(TCP_control_thread_params_t));
+    // 생성한 thread 에 넘기고, 해당 thread 가 종료 되어질 때,free 될 예정.
+    if(params==NULL){
+        return ENOMEM;
+    }
+    params->event_fd=event_fd;
+    params->server_fd=serv_sock;
+    int err = pthread_create(out_thread, NULL, TCP_control_thread, params);
+    if(err != 0){
+        free(params);
+    }
+    return err;
 }

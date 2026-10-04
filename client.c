@@ -4,25 +4,19 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <string.h>
 #include <sys/socket.h>
 
-#define MAX_FILE_LIST_BYTES (64U * 1024U)
+#define CLIENT_POLL_TIMEOUT_MS 1000
 
-static ssize_t read_all(int fd, void *buf, size_t total) {
-    unsigned char *bytes = buf;
-    size_t offset = 0;
+static volatile sig_atomic_t stop_requested = 0;
 
-    while (offset < total) {
-        ssize_t n = read(fd, bytes + offset, total - offset);
-        if (n > 0) {
-            offset += (size_t)n;
-        } else if (n == 0) {
-            return (ssize_t)offset;
-        } else if (errno != EINTR) {
-            return -1;
-        }
-    }
-    return (ssize_t)offset;
+static void handle_stop(int signo) {
+    (void)signo;
+    stop_requested = 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -47,6 +41,15 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    struct sigaction action = {0};
+    action.sa_handler = handle_stop;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, NULL) == -1 ||
+        sigaction(SIGTERM, &action, NULL) == -1) {
+        perror("sigaction");
+        return EXIT_FAILURE;
+    }
+
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == -1) {
         perror("socket");
@@ -54,58 +57,84 @@ int main(int argc, char *argv[]) {
     }
 
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        if (stop_requested) {
+            puts("connection cancelled");
+            close(sock);
+            return EXIT_SUCCESS;
+        }
         perror("connect");
         close(sock);
         return EXIT_FAILURE;
     }
 
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl");
+        close(sock);
+        return EXIT_FAILURE;
+    }
+
     printf("connected to %s:%ld\n", argv[1], port);
+    puts("waiting for server data or shutdown; press Ctrl+C to disconnect");
+    fflush(stdout);
 
-    uint32_t network_len;
-    ssize_t received = read_all(sock, &network_len, sizeof(network_len));
-    if (received < 0) {
-        perror("read file list length");
-        close(sock);
-        return EXIT_FAILURE;
-    }
-    if (received != (ssize_t)sizeof(network_len)) {
-        fprintf(stderr, "server closed before sending file list length\n");
-        close(sock);
-        return EXIT_FAILURE;
+    struct pollfd server = {.fd = sock, .events = POLLIN};
+    unsigned char buffer[4096];
+    int exit_status = EXIT_SUCCESS;
+
+    while (!stop_requested) {
+        // A finite timeout also covers a signal just before entering poll().
+        int ready = poll(&server, 1, CLIENT_POLL_TIMEOUT_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            exit_status = EXIT_FAILURE;
+            break;
+        }
+        if (stop_requested) break;
+        if (ready == 0) continue;
+
+        if (server.revents & POLLNVAL) {
+            fprintf(stderr, "invalid server socket\n");
+            exit_status = EXIT_FAILURE;
+            break;
+        }
+        if (server.revents & POLLERR) {
+            int socket_error = 0;
+            socklen_t error_len = sizeof(socket_error);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                           &socket_error, &error_len) == -1) {
+                perror("getsockopt");
+                exit_status = EXIT_FAILURE;
+                break;
+            }
+            if (socket_error != 0) {
+                fprintf(stderr, "server connection error: %s\n",
+                        strerror(socket_error));
+                exit_status = EXIT_FAILURE;
+                break;
+            }
+        }
+
+        if (server.revents & (POLLIN | POLLHUP)) {
+            ssize_t received = recv(sock, buffer, sizeof(buffer), 0);
+            if (received > 0) {
+                // The current server has no application protocol responses yet.
+                printf("received %zd bytes\n", received);
+                fflush(stdout);
+            } else if (received == 0) {
+                puts("server closed the connection");
+                break;
+            } else if (errno != EINTR && errno != EAGAIN &&
+                       errno != EWOULDBLOCK) {
+                perror("recv");
+                exit_status = EXIT_FAILURE;
+                break;
+            }
+        }
     }
 
-    uint32_t file_list_len = ntohl(network_len);
-    if (file_list_len > MAX_FILE_LIST_BYTES) {
-        fprintf(stderr, "file list is too large: %u bytes\n", (unsigned)file_list_len);
-        close(sock);
-        return EXIT_FAILURE;
-    }
-
-    char *files = malloc((size_t)file_list_len + 1);
-    if (files == NULL) {
-        perror("malloc");
-        close(sock);
-        return EXIT_FAILURE;
-    }
-
-    received = read_all(sock, files, file_list_len);
-    if (received < 0) {
-        perror("read file list");
-        free(files);
-        close(sock);
-        return EXIT_FAILURE;
-    }
-    if (received != (ssize_t)file_list_len) {
-        fprintf(stderr, "server closed before sending the complete file list\n");
-        free(files);
-        close(sock);
-        return EXIT_FAILURE;
-    }
-    files[file_list_len] = '\0';
-
-    printf("file list (%u bytes):\n", (unsigned)file_list_len);
-    puts(files);
-    free(files);
+    if (stop_requested) puts("disconnect requested");
     close(sock);
-    return EXIT_SUCCESS;
+    return exit_status;
 }
