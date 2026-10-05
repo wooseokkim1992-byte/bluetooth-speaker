@@ -1,0 +1,18 @@
+{
+    "configurations": [
+        {
+            "name": "Mac",
+            "compilerPath": "/usr/bin/clang",
+            "intelliSenseMode": "macos-clang-arm64",
+            "includePath": [
+                "${workspaceFolder}/header",
+                "${workspaceFolder}/**"
+            ],
+            "defines": [
+                "_POSIX_C_SOURCE=200809L"
+            ],
+            "cStandard": "c11"
+        }
+    ],
+    "version": 4
+}
