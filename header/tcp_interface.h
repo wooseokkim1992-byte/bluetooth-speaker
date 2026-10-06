@@ -4,7 +4,12 @@
 #include <stddef.h>
 #include <sys/types.h>
 #define SP_HEADER_SIZE 16u
-#define SP_MAX_PAYLOAD 24u
+#define SP_MAX_PAYLOAD 4096u
+#define SP_CONNECT_ACK_PAYLOAD_SIZE 24u
+#define SP_PONG_PAYLOAD_SIZE 9u
+#define SP_PAUSE_ACK_PAYLOAD_SIZE 1u
+#define SP_RESUME_ACK_PAYLOAD_SIZE 9u
+#define SP_NOW_PLAYING_FIXED_PAYLOAD_SIZE 10u
 #define SP_MAGIC UINT32_C(0x53504B32) /* SPK2 */
 #define SP_VERSION 2u
 #define SP_NO_REQUEST UINT32_C(0)
@@ -34,7 +39,7 @@ typedef struct
 	uint16_t flags;
 	uint32_t request_id;
 	uint32_t payload_len;
-} SpHeader; /* wire header is always 24 bytes */
+} SpHeader; /* wire header is always 16 bytes */
 typedef struct
 {
 	uint8_t client_id_utf8;
@@ -71,10 +76,20 @@ typedef struct
 {
 	uint64_t track_id;
 	uint16_t title_len;
-	uint16_t artist_len;
 	const uint8_t *title_utf8;
-	const uint8_t *artist_utf8;
 } SpNowPlaying;
+
+typedef struct
+{
+	uint8_t result; // 0:success 1:fail
+} SpPauseAck;
+
+typedef struct
+{
+	uint8_t result;
+	uint64_t live_pts_ms;
+} SpResumeAck;
+
 typedef struct
 {
 	uint16_t code;
@@ -95,3 +110,7 @@ int8_t parsing_payload_connect_REQ(SpHeader *header, void *data, size_t data_len
 
 int8_t construct_header(SpHeader *header, char *buf, size_t buf_size);
 int8_t construct_connect_payload(SpHeader *header, SpConnectAck *payload, char *buf, size_t buf_size);
+int8_t construct_pong_payload(SpHeader *header, SpPong *resp_data, char *buf, size_t buf_size);
+int8_t construct_resume_payload(SpHeader *header, SpResumeAck *resp_data, char *buf, size_t buf_size);
+int8_t construct_pause_payload(SpHeader *header, SpPauseAck *resp_data, char *buf, size_t buf_size);
+int8_t construct_Now_Playing_payload(SpHeader *header, SpNowPlaying *resp_data, char *buf, size_t buf_size);

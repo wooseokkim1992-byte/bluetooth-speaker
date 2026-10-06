@@ -26,12 +26,30 @@ typedef struct _TCP_control_thread_params_t
 client_arr_elem_t clients[CLIENT_BUCKET_COUNT] = {0};
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct
+{
+    uint8_t stream_state;
+    uint64_t live_pts_ms;
+    uint64_t track_id;
+    uint16_t title_len;
+    uint8_t title[SP_MAX_PAYLOAD - SP_NOW_PLAYING_FIXED_PAYLOAD_SIZE];
+    uint64_t revision;
+} broadcast_state_t;
+
+static broadcast_state_t broadcast_state = {0};
+static pthread_mutex_t broadcast_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static int8_t register_fd_to_clients(int fd, client_arr_elem_t *clients);
 static client_t *get_client_data(int fd, client_arr_elem_t *clients);
 static int8_t erase_client_data(int fd, client_arr_elem_t *clients);
 static int8_t init_cli_buf_state(client_t *cli);
 static int8_t scrap_data(int fd, char buf[], size_t buf_size, client_t *cli);
+static int8_t set_and_response(client_t *cli);
+static int8_t send_current_now_playing(client_t *cli);
+static int8_t get_broadcast_position(uint64_t *live_pts_ms,
+                                     uint8_t *stream_state);
 static void print_client_data(const client_t *cli);
+static void print_sp_header(const SpHeader *header);
 static void *TCP_control_thread(void *param)
 {
     TCP_control_thread_params_t *data = (TCP_control_thread_params_t *)param;
@@ -141,7 +159,11 @@ static void *TCP_control_thread(void *param)
                         else if (cli->received_state == PAYLOAD)
                         {
                             print_client_data(cli);
-                            init_cli_buf_state(cli);
+                            int8_t result = set_and_response(cli);
+                            if (result != 0)
+                                close_client = 1;
+                            else if (init_cli_buf_state(cli) != 0)
+                                close_client = 1;
                         }
                     }
                     else if (evt_list[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP))
@@ -221,6 +243,58 @@ int tcp_accept_loop(int serv_sock, int event_fd, pthread_t *out_thread)
     return err;
 }
 
+int tcp_server_update_broadcast(const SpNowPlaying *track,
+                                uint64_t live_pts_ms, uint8_t stream_state)
+{
+    if (stream_state > 1 || (stream_state == 1 &&
+        (track == NULL ||
+         track->title_len > sizeof(broadcast_state.title) ||
+         (track->title_len != 0 && track->title_utf8 == NULL))))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int lock_error = pthread_mutex_lock(&broadcast_mutex);
+    if (lock_error != 0)
+    {
+        errno = lock_error;
+        return -1;
+    }
+
+    int changed = broadcast_state.stream_state != stream_state;
+    if (stream_state == 1)
+    {
+        changed = changed || broadcast_state.track_id != track->track_id ||
+                  broadcast_state.title_len != track->title_len ||
+                  (track->title_len != 0 &&
+                   memcmp(broadcast_state.title, track->title_utf8,
+                          track->title_len) != 0);
+        if (changed)
+        {
+            broadcast_state.track_id = track->track_id;
+            broadcast_state.title_len = track->title_len;
+            if (track->title_len != 0)
+                memcpy(broadcast_state.title, track->title_utf8, track->title_len);
+        }
+    }
+    else
+    {
+        broadcast_state.track_id = 0;
+        broadcast_state.title_len = 0;
+    }
+    broadcast_state.live_pts_ms = stream_state == 1 ? live_pts_ms : 0;
+    broadcast_state.stream_state = stream_state;
+    if (changed)
+    {
+        ++broadcast_state.revision;
+        if (broadcast_state.revision == 0)
+            ++broadcast_state.revision;
+    }
+    pthread_mutex_unlock(&broadcast_mutex);
+    return 0;
+}
+
 static int8_t register_fd_to_clients(int fd, client_arr_elem_t clients[])
 {
     if (fd < 0 || clients == NULL)
@@ -261,6 +335,7 @@ static int8_t register_fd_to_clients(int fd, client_arr_elem_t clients[])
         .received_state = NOTHING,
         .received_byte = 0,
         .payload_len = 0,
+        .now_playing_revision = 0,
     };
     if (temp->client == NULL)
     {
@@ -421,7 +496,267 @@ static int8_t init_cli_buf_state(client_t *cli)
     return 0;
 }
 
-static void print_client_data(const client_t *cli)
+/* Only the TCP control thread writes to client sockets. A partial nonblocking
+ * send that cannot finish is treated as a broken connection. */
+static int8_t send_response_frame(const client_t *cli, uint8_t type,
+                                  uint32_t request_id, void *payload,
+                                  uint32_t payload_len)
+{
+    if (cli == NULL || payload_len > SP_MAX_PAYLOAD ||
+        (payload_len != 0 && payload == NULL))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    SpHeader header = {
+        .magic = SP_MAGIC,
+        .version = SP_VERSION,
+        .type = type,
+        .flags = 0,
+        .request_id = request_id,
+        .payload_len = payload_len,
+    };
+    char frame[SP_HEADER_SIZE + SP_MAX_PAYLOAD];
+    if (construct_header(&header, frame, SP_HEADER_SIZE) != 0)
+        return -1;
+
+    int8_t encoded = 0;
+    switch (type)
+    {
+    case SP_CONNECT_ACK:
+        encoded = construct_connect_payload(&header, payload,
+                                             frame + SP_HEADER_SIZE, payload_len);
+        break;
+    case SP_PONG:
+        encoded = construct_pong_payload(&header, payload,
+                                         frame + SP_HEADER_SIZE, payload_len);
+        break;
+    case SP_PAUSE_ACK:
+        encoded = construct_pause_payload(&header, payload,
+                                          frame + SP_HEADER_SIZE, payload_len);
+        break;
+    case SP_RESUME_ACK:
+        encoded = construct_resume_payload(&header, payload,
+                                           frame + SP_HEADER_SIZE, payload_len);
+        break;
+    case SP_NOW_PLAYING:
+        encoded = construct_Now_Playing_payload(&header, payload,
+                                                 frame + SP_HEADER_SIZE, payload_len);
+        break;
+    case SP_DISCONNECT_ACK:
+        if (payload_len != 0)
+            encoded = -1;
+        break;
+    default:
+        encoded = -1;
+        break;
+    }
+    if (encoded != 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t frame_len = SP_HEADER_SIZE + (size_t)payload_len;
+    size_t sent = 0;
+    while (sent < frame_len)
+    {
+        ssize_t n = send(cli->fd, frame + sent, frame_len - sent,
+                         MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0)
+            sent += (size_t)n;
+        else if (n < 0 && errno == EINTR)
+            continue;
+        else
+        {
+            if (n == 0)
+                errno = EPIPE;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int8_t get_broadcast_position(uint64_t *live_pts_ms,
+                                     uint8_t *stream_state)
+{
+    int lock_error = pthread_mutex_lock(&broadcast_mutex);
+    if (lock_error != 0)
+    {
+        errno = lock_error;
+        return -1;
+    }
+    *live_pts_ms = broadcast_state.live_pts_ms;
+    *stream_state = broadcast_state.stream_state;
+    pthread_mutex_unlock(&broadcast_mutex);
+    return 0;
+}
+
+/* A changed song is announced by the TCP thread on connect or the next PING.
+ * No audio thread writes directly to client sockets. */
+static int8_t send_current_now_playing(client_t *cli)
+{
+    uint8_t title[SP_MAX_PAYLOAD - SP_NOW_PLAYING_FIXED_PAYLOAD_SIZE];
+    uint64_t track_id;
+    uint64_t revision;
+    uint16_t title_len;
+
+    int lock_error = pthread_mutex_lock(&broadcast_mutex);
+    if (lock_error != 0)
+    {
+        errno = lock_error;
+        return -1;
+    }
+    if (broadcast_state.stream_state == 0 ||
+        broadcast_state.revision == cli->now_playing_revision)
+    {
+        pthread_mutex_unlock(&broadcast_mutex);
+        return 0;
+    }
+    track_id = broadcast_state.track_id;
+    title_len = broadcast_state.title_len;
+    revision = broadcast_state.revision;
+    if (title_len != 0)
+        memcpy(title, broadcast_state.title, title_len);
+    pthread_mutex_unlock(&broadcast_mutex);
+
+    SpNowPlaying now_playing = {
+        .track_id = track_id,
+        .title_len = title_len,
+        .title_utf8 = title_len != 0 ? title : NULL,
+    };
+    if (send_response_frame(cli, SP_NOW_PLAYING, SP_NO_REQUEST,
+                            &now_playing,
+                            SP_NOW_PLAYING_FIXED_PAYLOAD_SIZE + title_len) != 0)
+        return -1;
+    cli->now_playing_revision = revision;
+    return 0;
+}
+
+/* 0: keep connection, 1: close after ACK, -1: protocol/I/O error. */
+static int8_t set_and_response(client_t *cli)
+{
+    if (cli == NULL || cli->received_byte < SP_HEADER_SIZE)
+        return -1;
+
+    SpHeader request;
+    if (parsing_header(&request, cli->h_p_buf, SP_HEADER_SIZE) != 0)
+        return -1;
+    print_sp_header(&request);
+    if (request.magic != SP_MAGIC || request.version != SP_VERSION ||
+        request.flags != 0 || request.request_id == SP_NO_REQUEST ||
+        request.payload_len != cli->payload_len ||
+        cli->received_byte != SP_HEADER_SIZE + (size_t)request.payload_len)
+    {
+        fprintf(stderr, "invalid request header on fd %d\n", cli->fd);
+        return -1;
+    }
+
+    switch (request.type)
+    {
+    case SP_CONNECT_REQ:
+    {
+        if (cli->status != INIT)
+            return -1;
+        SpConnectRequest connect_req;
+        if (parsing_payload_connect_REQ(&request, cli->h_p_buf,
+                                        cli->received_byte, &connect_req) != 0)
+            return -1;
+
+        uint64_t live_pts_ms;
+        uint8_t stream_state;
+        if (get_broadcast_position(&live_pts_ms, &stream_state) != 0)
+            return -1;
+        /* Temporary Base profile until the database is connected. */
+        SpConnectAck ack = {
+            .result = 0,
+            .plan = 1,
+            .codec = 1,
+            .bitrate_bps = 128000,
+            .sample_rate_hz = 44100,
+            .channels = 2,
+            .live_pts_ms = stream_state == 1 ? live_pts_ms : 0,
+            .ping_interval_ms = 1000,
+            .pong_timeout_ms = 10000,
+        };
+        if (send_response_frame(cli, SP_CONNECT_ACK, request.request_id,
+                                &ack, SP_CONNECT_ACK_PAYLOAD_SIZE) != 0)
+            return -1;
+        cli->client_id = connect_req.client_id_utf8;
+        cli->status = PLAYING;
+        if (send_current_now_playing(cli) != 0)
+            return -1;
+        break;
+    }
+    case SP_PING:
+    {
+        if (request.payload_len != 0 || cli->status == INIT ||
+            cli->status == STOPPING)
+            return -1;
+        SpPong pong;
+        if (get_broadcast_position(&pong.live_pts_ms,
+                                   &pong.stream_state) != 0)
+            return -1;
+        if (send_response_frame(cli, SP_PONG, request.request_id,
+                                &pong, SP_PONG_PAYLOAD_SIZE) != 0)
+            return -1;
+        if (send_current_now_playing(cli) != 0)
+            return -1;
+        break;
+    }
+    case SP_PAUSE_REQ:
+    {
+        if (request.payload_len != 0 || cli->status != PLAYING)
+            return -1;
+        SpPauseAck ack = {.result = 0};
+        if (send_response_frame(cli, SP_PAUSE_ACK, request.request_id,
+                                &ack, SP_PAUSE_ACK_PAYLOAD_SIZE) != 0)
+            return -1;
+        cli->status = PAUSED;
+        break;
+    }
+    case SP_RESUME_REQ:
+    {
+        if (request.payload_len != 0 || cli->status != PAUSED)
+            return -1;
+        uint64_t live_pts_ms;
+        uint8_t stream_state;
+        if (get_broadcast_position(&live_pts_ms, &stream_state) != 0)
+            return -1;
+        SpResumeAck ack = {
+            .result = 0,
+            .live_pts_ms = stream_state == 1 ? live_pts_ms : 0,
+        };
+        if (send_response_frame(cli, SP_RESUME_ACK, request.request_id,
+                                &ack, SP_RESUME_ACK_PAYLOAD_SIZE) != 0)
+            return -1;
+        cli->status = PLAYING;
+        if (send_current_now_playing(cli) != 0)
+            return -1;
+        break;
+    }
+    case SP_DISCONNECT_REQ:
+        if (request.payload_len != 0 || cli->status == INIT)
+            return -1;
+        if (send_response_frame(cli, SP_DISCONNECT_ACK, request.request_id,
+                                NULL, 0) != 0)
+            return -1;
+        cli->status = STOPPING;
+        return 1;
+    default:
+        fprintf(stderr, "unsupported request type 0x%02x on fd %d\n",
+                request.type, cli->fd);
+        return -1;
+    }
+
+    if (gettimeofday(&cli->updated_time, NULL) != 0)
+        return -1;
+    return 0;
+}
+
+static void
+print_client_data(const client_t *cli)
 {
     if (cli == NULL)
         return;
@@ -447,5 +782,18 @@ static void print_client_data(const client_t *cli)
         printf("%02x ", (unsigned)(unsigned char)cli->h_p_buf[i]);
     }
     putchar('\n');
+    fflush(stdout);
+}
+
+static void print_sp_header(const SpHeader *header)
+{
+    if (header == NULL)
+        return;
+
+    printf("SpHeader: magic=0x%08x version=%u type=0x%02x "
+           "flags=0x%04x request_id=%u payload_len=%u\n",
+           (unsigned)header->magic, (unsigned)header->version,
+           (unsigned)header->type, (unsigned)header->flags,
+           (unsigned)header->request_id, (unsigned)header->payload_len);
     fflush(stdout);
 }

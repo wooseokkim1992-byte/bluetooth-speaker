@@ -33,6 +33,7 @@ typedef struct
     RECEOVED_STATE received_state;
     size_t received_byte;
     uint32_t payload_len;
+    uint64_t now_playing_revision;
     char h_p_buf[SP_HEADER_SIZE + SP_MAX_PAYLOAD];
 } client_t;
 
@@ -50,5 +51,10 @@ int tcp_open_listener(int port);
  * On success, the caller signals stop_evt_fd and joins *out_thread before
  * closing either fd. out_thread is only valid after a successful call. */
 int tcp_accept_loop(int serv_sock, int stop_evt_fd, pthread_t *out_thread);
+
+/* Called by the future audio supplier. Metadata is copied; the caller retains
+ * ownership of track->title_utf8. Pass NULL with stream_state=0 to stop. */
+int tcp_server_update_broadcast(const SpNowPlaying *track,
+                                uint64_t live_pts_ms, uint8_t stream_state);
 
 #endif
