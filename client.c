@@ -4,13 +4,16 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
+
+#include "tcp_interface.h"
 
 #define CLIENT_POLL_TIMEOUT_MS 1000
+#define HEADER_PAYLOAD_GAP_MS 100
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -19,9 +22,59 @@ static void handle_stop(int signo) {
     stop_requested = 1;
 }
 
+static uint32_t next_request_id(uint32_t *next_id) {
+    uint32_t id = *next_id;
+    *next_id = id + 1;
+    if (*next_id == SP_NO_REQUEST) *next_id = 1;
+    return id;
+}
+
+static int send_request(int sock, uint8_t type, uint32_t request_id,
+                        const uint8_t *payload, size_t payload_len) {
+    if (payload_len > SP_MAX_PAYLOAD || (payload_len > 0 && payload == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    SpHeader header = {
+        .magic = SP_MAGIC,
+        .version = SP_VERSION,
+        .type = type,
+        .flags = 0,
+        .request_id = request_id,
+        .payload_len = (uint32_t)payload_len,
+    };
+    char header_bytes[SP_HEADER_SIZE];
+    if (construct_header(&header, header_bytes, sizeof(header_bytes)) != 0) {
+        return -1;
+    }
+    if (write_all(sock, header_bytes, sizeof(header_bytes)) !=
+        (ssize_t)sizeof(header_bytes)) {
+        return -1;
+    }
+
+    if (payload_len > 0) {
+        struct timespec gap = {
+            .tv_sec = 0,
+            .tv_nsec = HEADER_PAYLOAD_GAP_MS * 1000000L,
+        };
+        while (nanosleep(&gap, &gap) == -1 && errno == EINTR) {
+            /* Complete the header/payload gap even if a signal arrives. */
+        }
+        if (write_all(sock, payload, payload_len) != (ssize_t)payload_len) {
+            return -1;
+        }
+    }
+
+    printf("sent type=0x%02x request_id=%u header=%u payload=%zu bytes\n",
+           type, request_id, SP_HEADER_SIZE, payload_len);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <server IPv4 address> <port number>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "usage: %s <server IPv4 address> <port number> [client_id 0..255]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -31,6 +84,17 @@ int main(int argc, char *argv[]) {
     if (errno != 0 || end == argv[2] || *end != '\0' || port < 1 || port > 65535) {
         fprintf(stderr, "invalid port number: %s\n", argv[2]);
         return EXIT_FAILURE;
+    }
+
+    uint8_t client_id = 1;
+    if (argc == 4) {
+        errno = 0;
+        unsigned long parsed_id = strtoul(argv[3], &end, 10);
+        if (errno != 0 || end == argv[3] || *end != '\0' || parsed_id > UINT8_MAX) {
+            fprintf(stderr, "invalid client_id: %s\n", argv[3]);
+            return EXIT_FAILURE;
+        }
+        client_id = (uint8_t)parsed_id;
     }
 
     struct sockaddr_in server_addr = {0};
@@ -47,6 +111,11 @@ int main(int argc, char *argv[]) {
     if (sigaction(SIGINT, &action, NULL) == -1 ||
         sigaction(SIGTERM, &action, NULL) == -1) {
         perror("sigaction");
+        return EXIT_FAILURE;
+    }
+    struct sigaction ignore_sigpipe = {.sa_handler = SIG_IGN};
+    if (sigaction(SIGPIPE, &ignore_sigpipe, NULL) == -1) {
+        perror("sigaction(SIGPIPE)");
         return EXIT_FAILURE;
     }
 
@@ -67,15 +136,16 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    int flags = fcntl(sock, F_GETFL, 0);
-    if (flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
-        perror("fcntl");
+    uint32_t request_id = 1;
+    if (send_request(sock, SP_CONNECT_REQ, next_request_id(&request_id),
+                     &client_id, sizeof(client_id)) != 0) {
+        perror("CONNECT_REQ");
         close(sock);
         return EXIT_FAILURE;
     }
 
     printf("connected to %s:%ld\n", argv[1], port);
-    puts("waiting for server data or shutdown; press Ctrl+C to disconnect");
+    puts("PING every second; press Ctrl+C to send DISCONNECT_REQ");
     fflush(stdout);
 
     struct pollfd server = {.fd = sock, .events = POLLIN};
@@ -92,7 +162,15 @@ int main(int argc, char *argv[]) {
             break;
         }
         if (stop_requested) break;
-        if (ready == 0) continue;
+        if (ready == 0) {
+            if (send_request(sock, SP_PING, next_request_id(&request_id),
+                             NULL, 0) != 0) {
+                perror("PING");
+                exit_status = EXIT_FAILURE;
+                break;
+            }
+            continue;
+        }
 
         if (server.revents & POLLNVAL) {
             fprintf(stderr, "invalid server socket\n");
@@ -134,7 +212,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (stop_requested) puts("disconnect requested");
+    if (stop_requested) {
+        if (send_request(sock, SP_DISCONNECT_REQ,
+                         next_request_id(&request_id), NULL, 0) != 0) {
+            perror("DISCONNECT_REQ");
+            exit_status = EXIT_FAILURE;
+        }
+    }
     close(sock);
     return exit_status;
 }

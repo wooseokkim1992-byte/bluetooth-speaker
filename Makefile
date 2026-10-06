@@ -10,10 +10,12 @@ CLIENT := $(BUILD_DIR)/client
 
 # Static libraries must follow their consumers in the link command.
 LIBRARIES := $(BUILD_DIR)/libtcp_server.a \
+             $(BUILD_DIR)/libtcp_interface.a \
              $(BUILD_DIR)/libfile_util.a \
              $(BUILD_DIR)/libsignal_util.a
 OBJECTS := $(BUILD_DIR)/server.o $(BUILD_DIR)/client.o \
-           $(BUILD_DIR)/tcp_server.o $(BUILD_DIR)/file_util.o \
+           $(BUILD_DIR)/tcp_server.o $(BUILD_DIR)/tcp_interface.o \
+           $(BUILD_DIR)/file_util.o \
            $(BUILD_DIR)/signal_util.o
 DEPS := $(OBJECTS:.o=.d)
 
@@ -26,10 +28,13 @@ libs: $(LIBRARIES)
 $(SERVER): $(BUILD_DIR)/server.o $(LIBRARIES)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(THREAD_FLAGS) -o $@ $^ $(LDLIBS)
 
-$(CLIENT): $(BUILD_DIR)/client.o
+$(CLIENT): $(BUILD_DIR)/client.o $(BUILD_DIR)/libtcp_interface.a
 	$(CC) $(CFLAGS) $(LDFLAGS) $(THREAD_FLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/libtcp_server.a: $(BUILD_DIR)/tcp_server.o
+	$(AR) rcs $@ $^
+
+$(BUILD_DIR)/libtcp_interface.a: $(BUILD_DIR)/tcp_interface.o
 	$(AR) rcs $@ $^
 
 $(BUILD_DIR)/libfile_util.a: $(BUILD_DIR)/file_util.o
