@@ -1,14 +1,17 @@
 #include "speaker_tasks.h"
 #include "speaker_protocol.h"
+#include "pcm_ring.h"
 
 #include <Network.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <driver/i2s_std.h>
 #include <esp_timer.h>
 
-#include <cstdlib>
+#include <cstring>
 
 // Defined in network_connection.ino. Keep credentials/configuration in one
 // place while the existing sketch is migrated to the current wire protocol.
@@ -56,20 +59,25 @@ namespace {
 constexpr UBaseType_t kNetworkPriority = 3;
 constexpr UBaseType_t kAudioPriority = 4;
 constexpr uint32_t kNetworkStackBytes = 6144;
-constexpr uint32_t kAudioStackBytes = 4096;
-constexpr TickType_t kPollTicks = pdMS_TO_TICKS(50);
+constexpr uint32_t kAudioStackBytes = 6144;
+// 44.1 kHz x 16-bit x 2 channels = 176400 bytes/s. A 50 ms poll with the
+// old 8 KiB read cap could not keep up with a raw PCM stream.
+constexpr TickType_t kPollTicks = pdMS_TO_TICKS(10);
 constexpr TickType_t kRetryTicks = pdMS_TO_TICKS(2000);
 constexpr TickType_t kWifiRetryTicks = pdMS_TO_TICKS(5000);
 constexpr TickType_t kConnectAckTimeoutTicks = pdMS_TO_TICKS(5000);
 constexpr size_t kConnectFrameSize = SP_HEADER_SIZE + SP_CONNECT_REQ_PAYLOAD_SIZE;
-constexpr size_t kNetworkReadChunk = 256;
+constexpr size_t kNetworkReadChunk = 1024;
 constexpr int kMaxReadChunksPerLoop = 32;
-
-struct AudioChunk {
-  uint8_t *data;
-  size_t length;
-  uint64_t pts_ms;
-};
+constexpr uint32_t kPcmSampleRate = 44100;
+constexpr size_t kPcmFrameBytes = 4;  // 16-bit left + 16-bit right.
+constexpr size_t kPcmRingBytes = 32768;
+constexpr size_t kPcmPrebufferBytes = 8192;
+constexpr size_t kI2sWriteBytes = 1024;
+constexpr gpio_num_t kI2sBclkPin = GPIO_NUM_26;
+constexpr gpio_num_t kI2sWsPin = GPIO_NUM_25;
+constexpr gpio_num_t kI2sDataPin = GPIO_NUM_22;
+constexpr size_t kMaxTitleBytes = SP_MAX_PAYLOAD - SP_NOW_PLAYING_FIXED_PAYLOAD_SIZE;
 
 struct HeartbeatState {
   uint32_t ping_interval_ms = 0;
@@ -81,9 +89,119 @@ struct HeartbeatState {
 };
 
 QueueHandle_t command_queue = nullptr;
-QueueHandle_t audio_queue = nullptr;
 TaskHandle_t network_task_handle = nullptr;
 TaskHandle_t audio_task_handle = nullptr;
+SemaphoreHandle_t audio_mutex = nullptr;
+SemaphoreHandle_t metadata_mutex = nullptr;
+i2s_chan_handle_t i2s_tx = nullptr;
+uint8_t pcm_storage[kPcmRingBytes];
+PcmRingBuffer pcm_ring(pcm_storage, sizeof(pcm_storage));
+bool audio_accepting = false;
+bool audio_primed = false;
+uint32_t audio_generation = 0;
+uint64_t newest_audio_pts_ms = 0;
+uint64_t current_track_id = 0;
+char current_title[kMaxTitleBytes + 1] = {};
+size_t current_title_len = 0;
+bool now_playing_valid = false;
+
+bool init_i2s_tx() {
+  i2s_chan_config_t channel_config =
+      I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  channel_config.dma_desc_num = 6;
+  channel_config.dma_frame_num = 128;
+  if (i2s_new_channel(&channel_config, &i2s_tx, nullptr) != ESP_OK) {
+    return false;
+  }
+
+  i2s_std_config_t config{};
+  const i2s_std_clk_config_t clock = I2S_STD_CLK_DEFAULT_CONFIG(kPcmSampleRate);
+  const i2s_std_slot_config_t slot =
+      I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                          I2S_SLOT_MODE_STEREO);
+  config.clk_cfg = clock;
+  config.slot_cfg = slot;
+  config.gpio_cfg.mclk = I2S_GPIO_UNUSED;  // MAX98357A does not need MCLK.
+  config.gpio_cfg.bclk = kI2sBclkPin;
+  config.gpio_cfg.ws = kI2sWsPin;
+  config.gpio_cfg.dout = kI2sDataPin;
+  config.gpio_cfg.din = I2S_GPIO_UNUSED;
+  if (i2s_channel_init_std_mode(i2s_tx, &config) != ESP_OK) {
+    i2s_del_channel(i2s_tx);
+    i2s_tx = nullptr;
+    return false;
+  }
+  return true;
+}
+
+void set_audio_accepting(bool accepting) {
+  xSemaphoreTake(audio_mutex, portMAX_DELAY);
+  bool changed = false;
+  if (audio_accepting != accepting || (!accepting && pcm_ring.size() != 0)) {
+    pcm_ring.clear();
+    audio_primed = false;
+    audio_accepting = accepting;
+    newest_audio_pts_ms = 0;
+    ++audio_generation;
+    changed = true;
+  }
+  xSemaphoreGive(audio_mutex);
+  if (changed && audio_task_handle != nullptr) xTaskNotifyGive(audio_task_handle);
+}
+
+void clear_now_playing() {
+  xSemaphoreTake(metadata_mutex, portMAX_DELAY);
+  current_track_id = 0;
+  current_title[0] = '\0';
+  current_title_len = 0;
+  now_playing_valid = false;
+  xSemaphoreGive(metadata_mutex);
+}
+
+bool update_now_playing(const SpNowPlaying &now_playing) {
+  xSemaphoreTake(metadata_mutex, portMAX_DELAY);
+  const bool changed = !now_playing_valid ||
+                       current_track_id != now_playing.track_id;
+  current_track_id = now_playing.track_id;
+  current_title_len = now_playing.title_len;
+  if (current_title_len != 0) {
+    memcpy(current_title, now_playing.title_utf8, current_title_len);
+  }
+  current_title[current_title_len] = '\0';
+  now_playing_valid = true;
+  xSemaphoreGive(metadata_mutex);
+  return changed;
+}
+
+bool enqueue_pcm(const SpAudioData &audio) {
+  if (audio.data == nullptr || audio.data_len == 0 ||
+      audio.data_len % kPcmFrameBytes != 0 ||
+      audio.data_len > kPcmRingBytes) {
+    return false;
+  }
+  xSemaphoreTake(audio_mutex, portMAX_DELAY);
+  if (!audio_accepting) {
+    xSemaphoreGive(audio_mutex);
+    return true;  // A stopped broadcast may still have an in-flight frame.
+  }
+  bool dropped_stale = false;
+  if (audio.data_len > pcm_ring.free_space() ||
+      (newest_audio_pts_ms != 0 &&
+       (audio.stream_pts_ms < newest_audio_pts_ms ||
+        audio.stream_pts_ms - newest_audio_pts_ms > 1000))) {
+    // Never play stale buffered audio after a slow consumer/producer burst.
+    pcm_ring.clear();
+    audio_primed = false;
+    ++audio_generation;
+    dropped_stale = true;
+  }
+  const bool written = pcm_ring.write(audio.data, audio.data_len);
+  if (written) newest_audio_pts_ms = audio.stream_pts_ms;
+  xSemaphoreGive(audio_mutex);
+  if (dropped_stale) Serial.println("PCM buffer reset: overflow or PTS jump");
+  if (written && audio_task_handle != nullptr) xTaskNotifyGive(audio_task_handle);
+  return written;
+}
 
 bool write_all(NetworkClient &client, const uint8_t *data, size_t length) {
   size_t sent = 0;
@@ -113,12 +231,15 @@ void reset_connection_state(SpResponseFrameReceiver &receiver,
   ack_received = false;
   heartbeat = {};
   sp_reset_response_frame(receiver);
+  set_audio_accepting(false);
+  clear_now_playing();
 }
 
 bool handle_response_frame(const SpResponseFrameReceiver &receiver,
                            uint32_t &pending_connect_request_id,
                            DeviceIdentity &identity, bool &ack_received,
-                           bool &should_connect, HeartbeatState &heartbeat) {
+                           bool &should_connect, HeartbeatState &heartbeat,
+                           bool &pcm_profile_supported) {
   SpResponsePayload payload{};
   const uint8_t *bytes = receiver.header.payload_len == 0
                              ? nullptr : receiver.payload;
@@ -152,6 +273,18 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
       return false;
     }
     ack_received = true;
+    pcm_profile_supported =
+        payload.connect_ack.codec == SP_CODEC_PCM_S16LE &&
+        payload.connect_ack.sample_rate_hz == kPcmSampleRate &&
+        payload.connect_ack.channels == 2;
+    set_audio_accepting(pcm_profile_supported);
+    if (!pcm_profile_supported) {
+      Serial.printf("Unsupported audio profile: codec=%u rate=%u channels=%u; "
+                    "control connection remains active\n",
+                    static_cast<unsigned>(payload.connect_ack.codec),
+                    static_cast<unsigned>(payload.connect_ack.sample_rate_hz),
+                    static_cast<unsigned>(payload.connect_ack.channels));
+    }
     heartbeat.ping_interval_ms = payload.connect_ack.ping_interval_ms;
     heartbeat.pong_timeout_ms = payload.connect_ack.pong_timeout_ms;
     heartbeat.pending_ping_request_id = SP_NO_REQUEST;
@@ -181,6 +314,8 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
     Serial.printf("PONG received (request_id=%u, stream_state=%u)\n",
                   static_cast<unsigned>(receiver.header.request_id),
                   static_cast<unsigned>(payload.pong.stream_state));
+    set_audio_accepting(pcm_profile_supported &&
+                        payload.pong.stream_state == 1);
     return true;
   }
 
@@ -195,8 +330,30 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
     return false;
   }
 
-  // Framing remains synchronized even when other messages follow the ACK.
-  // Playback and other control messages are integrated in later steps.
+  if (receiver.header.type == SP_NOW_PLAYING) {
+    if (receiver.header.request_id != SP_NO_REQUEST) return false;
+    const bool changed = update_now_playing(payload.now_playing);
+    if (changed) {
+      // A new track must not play PCM left over from the previous track.
+      set_audio_accepting(false);
+      set_audio_accepting(pcm_profile_supported);
+    }
+    Serial.printf("NOW_PLAYING track=%llu title_bytes=%u\n",
+                  static_cast<unsigned long long>(payload.now_playing.track_id),
+                  static_cast<unsigned>(payload.now_playing.title_len));
+    return true;
+  }
+
+  if (receiver.header.type == SP_AUDIO_DATA) {
+    if (receiver.header.request_id != SP_NO_REQUEST) return false;
+    if (!pcm_profile_supported) return true;  // Never send MP3 bytes to I2S.
+    if (!enqueue_pcm(payload.audio_data)) {
+      Serial.println("Invalid or unqueueable PCM AUDIO_DATA");
+      return false;
+    }
+    return true;
+  }
+
   return true;
 }
 
@@ -204,7 +361,8 @@ bool receive_available_frames(NetworkClient &client,
                               SpResponseFrameReceiver &receiver,
                               uint32_t &pending_connect_request_id,
                               DeviceIdentity &identity, bool &ack_received,
-                              bool &should_connect, HeartbeatState &heartbeat) {
+                              bool &should_connect, HeartbeatState &heartbeat,
+                              bool &pcm_profile_supported) {
   uint8_t incoming[kNetworkReadChunk];
   for (int chunk = 0; chunk < kMaxReadChunksPerLoop; ++chunk) {
     const int available = client.available();
@@ -229,7 +387,7 @@ bool receive_available_frames(NetworkClient &client,
       if (result == SpFrameFeedResult::Complete) {
         if (!handle_response_frame(receiver, pending_connect_request_id,
                                    identity, ack_received, should_connect,
-                                   heartbeat)) {
+                                   heartbeat, pcm_profile_supported)) {
           return false;
         }
         sp_reset_response_frame(receiver);
@@ -241,16 +399,63 @@ bool receive_available_frames(NetworkClient &client,
 
 
 void audio_task(void *) {
-  AudioChunk chunk{};
+  uint8_t output[kI2sWriteBytes];
+  bool tx_enabled = false;
+  uint32_t seen_generation = 0;
   for (;;) {
-    if (xQueueReceive(audio_queue, &chunk, portMAX_DELAY) != pdTRUE) {
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    const uint32_t generation = audio_generation;
+    const bool accepting = audio_accepting;
+    if (accepting && !audio_primed &&
+        pcm_ring.size() >= kPcmPrebufferBytes) {
+      audio_primed = true;
+    }
+    const size_t read_size = accepting && audio_primed
+                                 ? pcm_ring.read(output, sizeof(output)) : 0;
+    if (accepting && audio_primed && read_size == 0) audio_primed = false;
+    xSemaphoreGive(audio_mutex);
+
+    if (generation != seen_generation || !accepting || read_size == 0) {
+      if (tx_enabled) {
+        i2s_channel_disable(i2s_tx);
+        tx_enabled = false;
+      }
+      seen_generation = generation;
+    }
+    if (!accepting || read_size == 0) {
+      // A PAUSE, disconnect or underrun stops DMA output. Wait for new PCM.
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
       continue;
     }
 
-    // TODO: decode the compressed frame, then feed PCM to I2S DMA.
-    // No producer is connected to this queue until the wire parser and
-    // decoder are implemented. Do not claim that received audio is playing.
-    free(chunk.data);
+    // Drop bytes copied just before a network-side reset/track change.
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    const bool still_current =
+        audio_accepting && audio_generation == generation;
+    xSemaphoreGive(audio_mutex);
+    if (!still_current) continue;
+
+    if (!tx_enabled) {
+      if (i2s_channel_enable(i2s_tx) != ESP_OK) {
+        Serial.println("I2S TX enable failed");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+      tx_enabled = true;
+    }
+    size_t sent = 0;
+    while (sent < read_size) {
+      size_t written = 0;
+      const esp_err_t result = i2s_channel_write(
+          i2s_tx, output + sent, read_size - sent, &written, 20);
+      sent += written;
+      if (result != ESP_OK || written == 0) {
+        Serial.printf("I2S TX write failed: %d\n", static_cast<int>(result));
+        i2s_channel_disable(i2s_tx);
+        tx_enabled = false;
+        break;
+      }
+    }
   }
 }
 
@@ -264,6 +469,7 @@ void network_task(void *) {
   TickType_t connect_ack_deadline = 0;
   DeviceIdentity identity{};
   bool ack_received = false;
+  bool pcm_profile_supported = false;
   HeartbeatState heartbeat{};
   static SpResponseFrameReceiver receiver{};
   sp_reset_response_frame(receiver);
@@ -308,7 +514,8 @@ void network_task(void *) {
     if (client.available() > 0 &&
         !receive_available_frames(client, receiver,
                                   pending_connect_request_id, identity,
-                                  ack_received, should_connect, heartbeat)) {
+                                  ack_received, should_connect, heartbeat,
+                                  pcm_profile_supported)) {
       client.stop();
       reset_connection_state(receiver, pending_connect_request_id,
                              ack_received, heartbeat);
@@ -403,24 +610,34 @@ void network_task(void *) {
 }  // namespace
 
 bool start_speaker_tasks() {
-  if (command_queue != nullptr || audio_queue != nullptr) return false;
+  if (command_queue != nullptr || audio_mutex != nullptr ||
+      metadata_mutex != nullptr || i2s_tx != nullptr) return false;
 
   command_queue = xQueueCreate(8, sizeof(SpeakerCommand));
-  audio_queue = xQueueCreate(4, sizeof(AudioChunk));
-  if (command_queue == nullptr || audio_queue == nullptr) {
+  audio_mutex = xSemaphoreCreateMutex();
+  metadata_mutex = xSemaphoreCreateMutex();
+  if (command_queue == nullptr || audio_mutex == nullptr ||
+      metadata_mutex == nullptr || !init_i2s_tx()) {
     if (command_queue != nullptr) vQueueDelete(command_queue);
-    if (audio_queue != nullptr) vQueueDelete(audio_queue);
+    if (audio_mutex != nullptr) vSemaphoreDelete(audio_mutex);
+    if (metadata_mutex != nullptr) vSemaphoreDelete(metadata_mutex);
     command_queue = nullptr;
-    audio_queue = nullptr;
+    audio_mutex = nullptr;
+    metadata_mutex = nullptr;
+    Serial.println("Failed to prepare I2S audio pipeline");
     return false;
   }
 
   if (xTaskCreate(audio_task, "speaker_audio", kAudioStackBytes, nullptr,
                   kAudioPriority, &audio_task_handle) != pdPASS) {
     vQueueDelete(command_queue);
-    vQueueDelete(audio_queue);
+    vSemaphoreDelete(audio_mutex);
+    vSemaphoreDelete(metadata_mutex);
+    i2s_del_channel(i2s_tx);
     command_queue = nullptr;
-    audio_queue = nullptr;
+    audio_mutex = nullptr;
+    metadata_mutex = nullptr;
+    i2s_tx = nullptr;
     return false;
   }
 
@@ -429,9 +646,13 @@ bool start_speaker_tasks() {
     vTaskDelete(audio_task_handle);
     audio_task_handle = nullptr;
     vQueueDelete(command_queue);
-    vQueueDelete(audio_queue);
+    vSemaphoreDelete(audio_mutex);
+    vSemaphoreDelete(metadata_mutex);
+    i2s_del_channel(i2s_tx);
     command_queue = nullptr;
-    audio_queue = nullptr;
+    audio_mutex = nullptr;
+    metadata_mutex = nullptr;
+    i2s_tx = nullptr;
     return false;
   }
   return true;
@@ -444,4 +665,30 @@ bool post_speaker_command(SpeakerCommand command) {
   }
   return command_queue != nullptr &&
          xQueueSend(command_queue, &command, 0) == pdTRUE;
+}
+
+bool get_speaker_now_playing(uint64_t *track_id, char *title,
+                             size_t title_capacity) {
+  if (track_id == nullptr || title == nullptr || title_capacity == 0 ||
+      metadata_mutex == nullptr) {
+    return false;
+  }
+  xSemaphoreTake(metadata_mutex, portMAX_DELAY);
+  const bool valid = now_playing_valid;
+  if (valid) {
+    *track_id = current_track_id;
+    size_t copied = current_title_len < title_capacity - 1
+                        ? current_title_len : title_capacity - 1;
+    if (copied < current_title_len) {
+      // Do not terminate a truncated UTF-8 title inside a code point.
+      while (copied > 0 &&
+             (static_cast<uint8_t>(current_title[copied]) & 0xc0) == 0x80) {
+        --copied;
+      }
+    }
+    if (copied != 0) memcpy(title, current_title, copied);
+    title[copied] = '\0';
+  }
+  xSemaphoreGive(metadata_mutex);
+  return valid;
 }

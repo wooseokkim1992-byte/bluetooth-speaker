@@ -232,8 +232,8 @@ SpParseStatus sp_parse_response_payload(const SpHeader *header,
       break;
     case SP_AUDIO_DATA:
       parsed.audio_data.stream_pts_ms = read_u64_be(payload);
-      parsed.audio_data.mp3_len = static_cast<uint32_t>(length - sizeof(uint64_t));
-      parsed.audio_data.mp3_data = parsed.audio_data.mp3_len == 0
+      parsed.audio_data.data_len = static_cast<uint32_t>(length - sizeof(uint64_t));
+      parsed.audio_data.data = parsed.audio_data.data_len == 0
                                        ? nullptr : payload + sizeof(uint64_t);
       break;
     case SP_ERROR:

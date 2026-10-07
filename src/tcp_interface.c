@@ -279,6 +279,25 @@ int8_t construct_Now_Playing_payload(SpHeader *header, SpNowPlaying *resp_data, 
     return 0;
 }
 
+int8_t construct_audio_payload(SpHeader *header, const SpAudioData *audio,
+                               char *buf, size_t buf_size)
+{
+    if (audio == NULL || audio->data == NULL || audio->data_len == 0 ||
+        audio->data_len > SP_MAX_PAYLOAD - SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t payload_size = SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE + audio->data_len;
+    if (check_payload_args(header, audio, buf, buf_size, SP_AUDIO_DATA,
+                           payload_size) != 0)
+        return -1;
+    write_u64_be((uint8_t *)buf, audio->stream_pts_ms);
+    memcpy(buf + SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE, audio->data,
+           audio->data_len);
+    return 0;
+}
+
 int8_t construct_error_payload(SpHeader *header, SpError *resp_data, char *buf)
 {
     if (!header || !resp_data || !buf)

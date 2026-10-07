@@ -6,7 +6,8 @@
 | --- | --- | --- |
 | `src/signal_util.c`, `header/signal_util.h` | SIGINT 등록, 종료 요청 플래그 | `build/libsignal_util.a` |
 | `src/file_util.c`, `header/file_util.h` | 디렉터리 조회, 쉼표로 구분한 파일 목록 생성 | `build/libfile_util.a` |
-| `src/tcp_server.c`, `header/tcp_server.h` | TCP listen/accept, 클라이언트 스레드, 길이·목록 송신 | `build/libtcp_server.a` |
+| `src/tcp_server.c`, `header/tcp_server.h` | TCP 제어·오디오 생산 스레드, 방송 프레임 송신 | `build/libtcp_server.a` |
+| `src/tcp_interface.c`, `header/tcp_interface.h` | 16바이트 헤더와 메시지별 payload 직렬화 | `build/libtcp_interface.a` |
 | `server.c` | 인자 처리, 모듈 초기화와 종료 | 실행 파일 진입점 |
 
 기존 `file_util.h`의 송신 함수 선언은 `tcp_server.h`로 이동했다.
@@ -14,7 +15,9 @@ signal handler와 종료 플래그, TCP 스레드 함수와 인자 구조체는 
 
 ## 빌드와 실행
 
-POSIX C 컴파일러, GNU Make, ar가 필요하다. 프로젝트 루트에서 실행한다.
+Linux(epoll/eventfd), C11 컴파일러, GNU Make, ar, FFmpeg 실행 파일이 필요하다.
+Dockerfile에는 FFmpeg가 포함되어 있다. `files/1.mp3`를 찾을 수 있도록
+프로젝트 루트에서 실행한다.
 
 ```sh
 make
@@ -27,11 +30,13 @@ make
 ./build/client 127.0.0.1 9000
 ```
 
-서버는 기존처럼 실행 디렉터리 기준 `./files`를 읽는다.
-프로토콜도 동일하다: 4바이트 network byte order 길이와 해당 길이만큼의
-쉼표 구분 파일명 문자열을 전송한다. 문자열 종료 NUL은 보내지 않는다.
-목록 전송 후 연결을 닫는 동작과 SIGINT 기반 종료 방식은 유지했다.
-A2DP나 새로운 재생 로직은 추가하지 않았다.
+서버는 시작할 때 `files/1.mp3`를 44.1 kHz, 16-bit stereo PCM으로
+디코딩한다. 오디오 생산 스레드는 파일을 반복 재생하며 20 ms마다
+`AUDIO_DATA` 프레임을 만들고, TCP 제어 스레드만 각 PLAYING 클라이언트
+소켓에 전송한다. 접속하면 PCM 프로필을 CONNECT_ACK로 알리고
+NOW_PLAYING(제목 `1.mp3`)을 보낸다. PAUSE 클라이언트에는 오디오를 보내지
+않고 RESUME 이후 최신 방송 시점부터 보낸다. 테스트용 `client.c`는 오디오를
+재생하지 않고 수신 바이트 수만 출력한다.
 
 기존 루트의 `server`, `client` 실행 파일은 덮어쓰지 않는다.
 새로 빌드한 버전은 반드시 `./build/server`, `./build/client`로 실행한다.
@@ -41,7 +46,7 @@ A2DP나 새로운 재생 로직은 추가하지 않았다.
 - `make` / `make all`: 라이브러리, 서버, 클라이언트 빌드.
 - `make server`: 서버와 필요한 라이브러리만 빌드.
 - `make client`: 기존 테스트 클라이언트만 빌드.
-- `make libs`: 정적 라이브러리 3개만 빌드.
+- `make libs`: 정적 라이브러리만 빌드.
 - `make -j4`: 병렬 빌드.
 - `make clean`: 이 Makefile에서 생성한 파일만 제거. 소스·음원·기존 루트 실행 파일은 유지.
 - `make CC=gcc`: 컴파일러 선택. `AR`, `CFLAGS`, `CPPFLAGS`,

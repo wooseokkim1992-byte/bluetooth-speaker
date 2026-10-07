@@ -192,8 +192,8 @@ void test_other_responses() {
   assert(sp_parse_response_payload(&header, audio, sizeof(audio), &parsed) ==
          SpParseStatus::Ok);
   assert(parsed.audio_data.stream_pts_ms == 77);
-  assert(parsed.audio_data.mp3_len == 3);
-  assert(parsed.audio_data.mp3_data == audio + 8);
+  assert(parsed.audio_data.data_len == 3);
+  assert(parsed.audio_data.data == audio + 8);
 
   header = parse_header(SP_ERROR, 6);
   const uint8_t error[6] = {0, 9, 0, 2, 'N', 'O'};

@@ -7,9 +7,12 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <errno.h>
@@ -17,12 +20,40 @@
 #include "signal_util.h"
 #define MAX_LISTEN 10
 #define MAX_EPOLL 10
+#define PCM_SAMPLE_RATE 44100u
+#define PCM_BYTES_PER_SAMPLE_FRAME 4u
+#define AUDIO_CHUNK_SAMPLES 882u /* 20 ms at 44.1 kHz */
+#define AUDIO_CHUNK_BYTES (AUDIO_CHUNK_SAMPLES * PCM_BYTES_PER_SAMPLE_FRAME)
+#define AUDIO_QUEUE_CAPACITY 8u
+#define MAX_DECODED_PCM_BYTES (64u * 1024u * 1024u)
 
 typedef struct _TCP_control_thread_params_t
 {
     int server_fd;
     int event_fd;
+    uint8_t *pcm_data;
+    size_t pcm_len;
 } TCP_control_thread_params_t;
+
+typedef struct
+{
+    uint64_t pts_ms;
+    uint8_t bytes[AUDIO_CHUNK_BYTES];
+} audio_chunk_t;
+
+typedef struct
+{
+    int wake_fd;
+    pthread_mutex_t mutex;
+    atomic_bool stop;
+    const uint8_t *pcm_data;
+    size_t pcm_len;
+    size_t pcm_offset;
+    uint64_t emitted_samples;
+    audio_chunk_t queue[AUDIO_QUEUE_CAPACITY];
+    size_t queue_head;
+    size_t queue_count;
+} audio_stream_t;
 
 client_arr_elem_t clients[CLIENT_BUCKET_COUNT] = {0};
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -49,6 +80,16 @@ static int8_t set_and_response(client_t *cli);
 static int8_t send_current_now_playing(client_t *cli);
 static int8_t get_broadcast_position(uint64_t *live_pts_ms,
                                      uint8_t *stream_state);
+static int load_demo_pcm(uint8_t **out_data, size_t *out_len);
+static int start_audio_stream(audio_stream_t *stream, pthread_t *out_thread,
+                              int epoll_fd, const uint8_t *pcm_data,
+                              size_t pcm_len);
+static void stop_audio_stream(audio_stream_t *stream, pthread_t thread);
+static void *audio_producer_thread(void *arg);
+static void dispatch_audio_chunks(audio_stream_t *stream, int epoll_fd);
+static int8_t send_response_frame(const client_t *cli, uint8_t type,
+                                  uint32_t request_id, void *payload,
+                                  uint32_t payload_len);
 static void print_client_data(const client_t *cli);
 static void print_sp_header(const SpHeader *header);
 static void print_sp_payload(const SpHeader *header, const char *frame,
@@ -66,7 +107,10 @@ static void *TCP_control_thread(void *param)
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0)
     {
-        fprintf(stderr, "failed to create epool");
+        perror("failed to create epoll");
+        free(data->pcm_data);
+        free(param);
+        return NULL;
     }
     else
     {
@@ -77,6 +121,7 @@ static void *TCP_control_thread(void *param)
         {
             perror("Failed to register epoll.\n");
             close(epoll_fd);
+            free(data->pcm_data);
             free(param);
             data = NULL;
             return NULL;
@@ -88,16 +133,29 @@ static void *TCP_control_thread(void *param)
         {
             perror("Failed to register epoll.\n");
             close(epoll_fd);
+            free(data->pcm_data);
             free(param);
             data = NULL;
             return NULL;
         }
 
-        struct epoll_event evt_list[CLIENT_BUCKET_COUNT + 2];
+        audio_stream_t audio_stream;
+        pthread_t audio_thread;
+        if (start_audio_stream(&audio_stream, &audio_thread, epoll_fd,
+                               data->pcm_data, data->pcm_len) != 0)
+        {
+            perror("failed to start audio stream");
+            close(epoll_fd);
+            free(data->pcm_data);
+            free(param);
+            return NULL;
+        }
+
+        struct epoll_event evt_list[CLIENT_BUCKET_COUNT + 3];
 
         while (1)
         {
-            int evt_cnt = epoll_wait(epoll_fd, evt_list, CLIENT_BUCKET_COUNT + 2, -1);
+            int evt_cnt = epoll_wait(epoll_fd, evt_list, CLIENT_BUCKET_COUNT + 3, -1);
             if (evt_cnt < 0)
             {
                 if (errno == EINTR)
@@ -105,7 +163,7 @@ static void *TCP_control_thread(void *param)
                 break;
             }
             int8_t break_flag = 0;
-            for (int8_t i = 0; i < evt_cnt; i++)
+            for (int i = 0; i < evt_cnt; i++)
             {
                 if (evt_list[i].data.fd == server_fd)
                 {
@@ -147,6 +205,21 @@ static void *TCP_control_thread(void *param)
                         break;
                     }
                 }
+                else if (evt_list[i].data.fd == audio_stream.wake_fd)
+                {
+                    if (evt_list[i].events & EPOLLIN)
+                    {
+                        uint64_t wake_count;
+                        ssize_t n;
+                        do
+                        {
+                            n = read(audio_stream.wake_fd, &wake_count,
+                                     sizeof(wake_count));
+                        } while (n < 0 && errno == EINTR);
+                        if (n == (ssize_t)sizeof(wake_count))
+                            dispatch_audio_chunks(&audio_stream, epoll_fd);
+                    }
+                }
                 else
                 {
                     int temp_fd = evt_list[i].data.fd;
@@ -186,8 +259,10 @@ static void *TCP_control_thread(void *param)
             if (break_flag)
                 break;
         }
+        stop_audio_stream(&audio_stream, audio_thread);
     }
     close(epoll_fd);
+    free(data->pcm_data);
     free(param);
     data = NULL;
     return NULL;
@@ -238,12 +313,267 @@ int tcp_accept_loop(int serv_sock, int event_fd, pthread_t *out_thread)
     }
     params->event_fd = event_fd;
     params->server_fd = serv_sock;
+    if (load_demo_pcm(&params->pcm_data, &params->pcm_len) != 0)
+    {
+        int load_error = errno != 0 ? errno : EIO;
+        free(params);
+        return load_error;
+    }
     int err = pthread_create(out_thread, NULL, TCP_control_thread, params);
     if (err != 0)
     {
+        free(params->pcm_data);
         free(params);
     }
     return err;
+}
+
+static int load_demo_pcm(uint8_t **out_data, size_t *out_len)
+{
+    size_t capacity = 1024u * 1024u;
+    size_t length = 0;
+    uint8_t *pcm = malloc(capacity);
+    if (pcm == NULL)
+        return -1;
+
+    /* The input path is fixed; no user-provided text is passed to the shell. */
+    FILE *decoder = popen("ffmpeg -nostdin -hide_banner -loglevel error "
+                          "-i files/1.mp3 -f s16le -acodec pcm_s16le "
+                          "-ar 44100 -ac 2 pipe:1", "r");
+    if (decoder == NULL)
+    {
+        free(pcm);
+        return -1;
+    }
+
+    int failure_errno = 0;
+    for (;;)
+    {
+        if (length == capacity)
+        {
+            if (capacity == MAX_DECODED_PCM_BYTES)
+            {
+                failure_errno = EFBIG;
+                break;
+            }
+            size_t new_capacity = capacity * 2;
+            if (new_capacity > MAX_DECODED_PCM_BYTES)
+                new_capacity = MAX_DECODED_PCM_BYTES;
+            uint8_t *larger = realloc(pcm, new_capacity);
+            if (larger == NULL)
+            {
+                failure_errno = ENOMEM;
+                break;
+            }
+            pcm = larger;
+            capacity = new_capacity;
+        }
+        size_t n = fread(pcm + length, 1, capacity - length, decoder);
+        length += n;
+        if (n == 0)
+        {
+            if (ferror(decoder))
+                failure_errno = EIO;
+            break;
+        }
+    }
+    if (failure_errno != 0)
+    {
+        uint8_t discard[8192];
+        while (fread(discard, 1, sizeof(discard), decoder) != 0)
+        {
+            /* Drain the decoder pipe before pclose() to avoid blocking it. */
+        }
+    }
+    int decoder_status = pclose(decoder);
+    if (failure_errno != 0 || decoder_status != 0 || length == 0 ||
+        length % PCM_BYTES_PER_SAMPLE_FRAME != 0)
+    {
+        errno = failure_errno != 0 ? failure_errno : EIO;
+        free(pcm);
+        return -1;
+    }
+
+    *out_data = pcm;
+    *out_len = length;
+    fprintf(stdout, "decoded files/1.mp3: %zu PCM bytes, 44.1 kHz stereo\n",
+            length);
+    return 0;
+}
+
+static int start_audio_stream(audio_stream_t *stream, pthread_t *out_thread,
+                              int epoll_fd, const uint8_t *pcm_data,
+                              size_t pcm_len)
+{
+    memset(stream, 0, sizeof(*stream));
+    stream->wake_fd = -1;
+    stream->pcm_data = pcm_data;
+    stream->pcm_len = pcm_len;
+    atomic_init(&stream->stop, 0);
+    int err = pthread_mutex_init(&stream->mutex, NULL);
+    if (err != 0)
+    {
+        errno = err;
+        return -1;
+    }
+
+    stream->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (stream->wake_fd < 0)
+    {
+        pthread_mutex_destroy(&stream->mutex);
+        return -1;
+    }
+    struct epoll_event audio_event = {
+        .events = EPOLLIN | EPOLLERR,
+        .data.fd = stream->wake_fd,
+    };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, stream->wake_fd,
+                  &audio_event) != 0)
+    {
+        close(stream->wake_fd);
+        pthread_mutex_destroy(&stream->mutex);
+        return -1;
+    }
+    err = pthread_create(out_thread, NULL, audio_producer_thread, stream);
+    if (err != 0)
+    {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, stream->wake_fd, NULL);
+        close(stream->wake_fd);
+        pthread_mutex_destroy(&stream->mutex);
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+
+static void stop_audio_stream(audio_stream_t *stream, pthread_t thread)
+{
+    atomic_store(&stream->stop, 1);
+    pthread_join(thread, NULL);
+    close(stream->wake_fd);
+    pthread_mutex_destroy(&stream->mutex);
+    tcp_server_update_broadcast(NULL, 0, 0);
+}
+
+static void *audio_producer_thread(void *arg)
+{
+    audio_stream_t *stream = arg;
+    static const uint8_t title[] = "1.mp3";
+    SpNowPlaying track = {
+        .track_id = 1,
+        .title_len = sizeof(title) - 1,
+        .title_utf8 = title,
+    };
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+        return NULL;
+
+    while (!atomic_load(&stream->stop))
+    {
+        audio_chunk_t chunk = {
+            .pts_ms = stream->emitted_samples * 1000u / PCM_SAMPLE_RATE,
+        };
+        size_t copied = 0;
+        while (copied < AUDIO_CHUNK_BYTES)
+        {
+            size_t remaining = stream->pcm_len - stream->pcm_offset;
+            size_t count = AUDIO_CHUNK_BYTES - copied;
+            if (count > remaining)
+                count = remaining;
+            memcpy(chunk.bytes + copied, stream->pcm_data + stream->pcm_offset,
+                   count);
+            copied += count;
+            stream->pcm_offset = (stream->pcm_offset + count) % stream->pcm_len;
+        }
+        stream->emitted_samples += AUDIO_CHUNK_SAMPLES;
+
+        if (tcp_server_update_broadcast(&track, chunk.pts_ms, 1) != 0)
+            break;
+        pthread_mutex_lock(&stream->mutex);
+        if (stream->queue_count == AUDIO_QUEUE_CAPACITY)
+        {
+            stream->queue_head = (stream->queue_head + 1) % AUDIO_QUEUE_CAPACITY;
+            --stream->queue_count;
+        }
+        size_t tail = (stream->queue_head + stream->queue_count) %
+                      AUDIO_QUEUE_CAPACITY;
+        stream->queue[tail] = chunk;
+        ++stream->queue_count;
+        pthread_mutex_unlock(&stream->mutex);
+
+        uint64_t one = 1;
+        ssize_t wake;
+        do
+        {
+            wake = write(stream->wake_fd, &one, sizeof(one));
+        } while (wake < 0 && errno == EINTR);
+        if (wake < 0 && errno != EAGAIN)
+            break;
+
+        deadline.tv_nsec += 20000000L;
+        if (deadline.tv_nsec >= 1000000000L)
+        {
+            deadline.tv_nsec -= 1000000000L;
+            ++deadline.tv_sec;
+        }
+        int sleep_error;
+        do
+        {
+            sleep_error = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+                                          &deadline, NULL);
+        } while (sleep_error == EINTR && !atomic_load(&stream->stop));
+        if (sleep_error != 0 && sleep_error != EINTR)
+            break;
+    }
+    tcp_server_update_broadcast(NULL, 0, 0);
+    return NULL;
+}
+
+static void dispatch_audio_chunks(audio_stream_t *stream, int epoll_fd)
+{
+    for (;;)
+    {
+        audio_chunk_t chunk;
+        pthread_mutex_lock(&stream->mutex);
+        if (stream->queue_count == 0)
+        {
+            pthread_mutex_unlock(&stream->mutex);
+            break;
+        }
+        chunk = stream->queue[stream->queue_head];
+        stream->queue_head = (stream->queue_head + 1) % AUDIO_QUEUE_CAPACITY;
+        --stream->queue_count;
+        pthread_mutex_unlock(&stream->mutex);
+
+        SpAudioData audio = {
+            .stream_pts_ms = chunk.pts_ms,
+            .data = chunk.bytes,
+            .data_len = AUDIO_CHUNK_BYTES,
+        };
+        for (size_t bucket = 0; bucket < CLIENT_BUCKET_COUNT; ++bucket)
+        {
+            client_arr_elem_t *node = &clients[bucket];
+            while (node != NULL && node->client != NULL)
+            {
+                client_t *cli = node->client;
+                int fd = cli->fd;
+                if (cli->status == PLAYING &&
+                    send_response_frame(cli, SP_AUDIO_DATA, SP_NO_REQUEST,
+                                        &audio,
+                                        SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE +
+                                            audio.data_len) != 0)
+                {
+                    perror("audio send failed; disconnecting client");
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                    erase_client_data(fd, clients);
+                    close(fd);
+                    node = &clients[bucket];
+                    continue;
+                }
+                node = node->next;
+            }
+        }
+    }
 }
 
 int tcp_server_update_broadcast(const SpNowPlaying *track,
@@ -547,6 +877,10 @@ static int8_t send_response_frame(const client_t *cli, uint8_t type,
         encoded = construct_Now_Playing_payload(&header, payload,
                                                 frame + SP_HEADER_SIZE, payload_len);
         break;
+    case SP_AUDIO_DATA:
+        encoded = construct_audio_payload(&header, payload,
+                                          frame + SP_HEADER_SIZE, payload_len);
+        break;
     case SP_DISCONNECT_ACK:
         if (payload_len != 0)
             encoded = -1;
@@ -685,8 +1019,8 @@ static int8_t set_and_response(client_t *cli)
         SpConnectAck ack = {
             .result = 0,
             .plan = 1,
-            .codec = 1,
-            .bitrate_bps = 128000,
+            .codec = SP_CODEC_PCM_S16LE,
+            .bitrate_bps = PCM_SAMPLE_RATE * 16u * 2u,
             .sample_rate_hz = 44100,
             .channels = 2,
             .live_pts_ms = stream_state == 1 ? live_pts_ms : 0,

@@ -106,6 +106,29 @@ static void test_now_playing(void)
                                          sizeof(wire)) == -1);
 }
 
+static void test_audio_payload(void)
+{
+    const uint8_t pcm[] = {0x01, 0x02, 0x03, 0x04,
+                           0x05, 0x06, 0x07, 0x08};
+    SpAudioData audio = {
+        .stream_pts_ms = UINT64_C(0x0102030405060708),
+        .data = pcm,
+        .data_len = sizeof(pcm),
+    };
+    SpHeader header = {SP_MAGIC, SP_VERSION, SP_AUDIO_DATA, 0, 0,
+                       SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE + sizeof(pcm)};
+    const uint8_t expected[] = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
+    };
+    uint8_t wire[sizeof(expected)] = {0};
+    assert(construct_audio_payload(&header, &audio, (char *)wire,
+                                   sizeof(wire)) == 0);
+    assert(memcmp(wire, expected, sizeof(wire)) == 0);
+    assert(construct_audio_payload(&header, &audio, (char *)wire,
+                                   sizeof(wire) - 1) == -1);
+}
+
 static void test_generate_token(void)
 {
     uint64_t token = 0;
@@ -120,6 +143,7 @@ int main(void)
     test_connect_ack();
     test_pong_pause_resume();
     test_now_playing();
+    test_audio_payload();
     test_generate_token();
     return 0;
 }
