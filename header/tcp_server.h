@@ -27,7 +27,7 @@ typedef enum _SESSION_STATE
 typedef struct
 {
     int fd;
-    uint8_t client_id;    // 1바이트 바이너리 UUID
+    uint64_t client_id;   // 8바이트 클라이언트 ID
     SESSION_STATE status; // PLAYING, STOPPING, PAUSED
     struct timeval updated_time;
     RECEOVED_STATE received_state;

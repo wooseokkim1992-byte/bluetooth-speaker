@@ -74,7 +74,7 @@ static int send_request(int sock, uint8_t type, uint32_t request_id,
 
 int main(int argc, char *argv[]) {
     if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: %s <server IPv4 address> <port number> [client_id 0..255]\n", argv[0]);
+        fprintf(stderr, "usage: %s <server IPv4 address> <port number> [client_id u64]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -86,15 +86,15 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    uint8_t client_id = 1;
+    uint64_t client_id = 1;
     if (argc == 4) {
         errno = 0;
-        unsigned long parsed_id = strtoul(argv[3], &end, 10);
-        if (errno != 0 || end == argv[3] || *end != '\0' || parsed_id > UINT8_MAX) {
+        unsigned long long parsed_id = strtoull(argv[3], &end, 10);
+        if (errno != 0 || end == argv[3] || *end != '\0' || argv[3][0] == '-') {
             fprintf(stderr, "invalid client_id: %s\n", argv[3]);
             return EXIT_FAILURE;
         }
-        client_id = (uint8_t)parsed_id;
+        client_id = (uint64_t)parsed_id;
     }
 
     struct sockaddr_in server_addr = {0};
@@ -137,8 +137,17 @@ int main(int argc, char *argv[]) {
     }
 
     uint32_t request_id = 1;
-    if (send_request(sock, SP_CONNECT_REQ, next_request_id(&request_id),
-                     &client_id, sizeof(client_id)) != 0) {
+    SpConnectRequest connect_req = {.client_id_utf8 = client_id, .token = 0};
+    SpHeader connect_header = {
+        .type = SP_CONNECT_REQ,
+        .payload_len = SP_CONNECT_REQ_PAYLOAD_SIZE,
+    };
+    uint8_t connect_payload[SP_CONNECT_REQ_PAYLOAD_SIZE];
+    if (construct_connect_request_payload(&connect_header, &connect_req,
+                                          (char *)connect_payload,
+                                          sizeof(connect_payload)) != 0 ||
+        send_request(sock, SP_CONNECT_REQ, next_request_id(&request_id),
+                     connect_payload, sizeof(connect_payload)) != 0) {
         perror("CONNECT_REQ");
         close(sock);
         return EXIT_FAILURE;

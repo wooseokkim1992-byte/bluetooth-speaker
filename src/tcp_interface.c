@@ -1,11 +1,11 @@
 #include "tcp_interface.h"
 #include <string.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
 #include <arpa/inet.h>
 #include <stdio.h>
+#include <sys/random.h>
 
 static uint16_t read_u16_be(const uint8_t *buf)
 {
@@ -155,14 +155,16 @@ int8_t parsing_header(SpHeader *header, const char *buf, size_t buf_size)
 int8_t parsing_payload_connect_REQ(SpHeader *header, void *data, size_t data_len, SpConnectRequest *req)
 {
     if (header == NULL || data == NULL || req == NULL ||
-        header->type != SP_CONNECT_REQ || header->payload_len != 1 ||
-        data_len != SP_HEADER_SIZE + 1)
+        header->type != SP_CONNECT_REQ ||
+        header->payload_len != SP_CONNECT_REQ_PAYLOAD_SIZE ||
+        data_len != SP_HEADER_SIZE + SP_CONNECT_REQ_PAYLOAD_SIZE)
     {
         errno = EINVAL;
         return -1;
     }
-    const uint8_t *data_handler = (const uint8_t *)data;
-    req->client_id_utf8 = data_handler[SP_HEADER_SIZE];
+    const uint8_t *payload = (const uint8_t *)data + SP_HEADER_SIZE;
+    req->client_id_utf8 = ntoh64(payload);
+    req->token = ntoh64(payload + 8);
     return 0;
 }
 
@@ -184,6 +186,19 @@ int8_t construct_header(SpHeader *header, char *buf, size_t buf_size)
     return 0;
 }
 
+int8_t construct_connect_request_payload(SpHeader *header,
+                                         SpConnectRequest *payload,
+                                         char *buf, size_t buf_size)
+{
+    if (check_payload_args(header, payload, buf, buf_size, SP_CONNECT_REQ,
+                           SP_CONNECT_REQ_PAYLOAD_SIZE) != 0)
+        return -1;
+    uint8_t *bytes = (uint8_t *)buf;
+    write_u64_be(bytes, payload->client_id_utf8);
+    write_u64_be(bytes + 8, payload->token);
+    return 0;
+}
+
 int8_t construct_connect_payload(SpHeader *header, SpConnectAck *payload, char *buf, size_t buf_size)
 {
     if (check_payload_args(header, payload, buf, buf_size, SP_CONNECT_ACK,
@@ -199,6 +214,7 @@ int8_t construct_connect_payload(SpHeader *header, SpConnectAck *payload, char *
     write_u64_be(bytes + 12, payload->live_pts_ms);
     write_u16_be(bytes + 20, payload->ping_interval_ms);
     write_u16_be(bytes + 22, payload->pong_timeout_ms);
+    write_u64_be(bytes + 24, payload->token);
     return 0;
 }
 
@@ -260,5 +276,75 @@ int8_t construct_Now_Playing_payload(SpHeader *header, SpNowPlaying *resp_data, 
     if (resp_data->title_len != 0)
         memcpy(bytes + SP_NOW_PLAYING_FIXED_PAYLOAD_SIZE,
                resp_data->title_utf8, resp_data->title_len);
+    return 0;
+}
+
+int8_t construct_error_payload(SpHeader *header, SpError *resp_data, char *buf)
+{
+    if (!header || !resp_data || !buf)
+    {
+        perror("not enough objs\n");
+        return -2;
+    }
+    if (header->payload_len > SP_MAX_PAYLOAD)
+    {
+        perror("not a proper size\n");
+        return -1;
+    }
+    write_u16_be((uint8_t *)buf, resp_data->code);
+    memcpy(buf + 2, resp_data->detail_utf8, resp_data->detail_len);
+    return 0;
+}
+
+int8_t generate_token(uint64_t *token)
+{
+    if (token == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t val;
+    do
+    {
+        size_t received = 0;
+        while (received < sizeof(val))
+        {
+            ssize_t n = getrandom((unsigned char *)&val + received, sizeof(val) - received, 0);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return -1;
+            }
+            if (n == 0)
+            {
+                errno = EIO;
+                return -1;
+            }
+            received += (size_t)n;
+        }
+    } while (val == 0);
+    *token = val;
+    return 0;
+}
+
+int8_t check_magic_num(SpHeader *header)
+{
+    if (header == NULL)
+    {
+        perror("no header obj");
+        return -1;
+    }
+    uint8_t *magic_hex = (uint8_t *)(&header->magic);
+    uint32_t original_magic = (uint32_t)SP_MAGIC;
+    uint8_t *original_magic_bytes = (uint8_t *)&original_magic;
+    for (int8_t i = 0; i < 4; i++)
+    {
+        uint8_t result = magic_hex[i] ^ original_magic_bytes[i];
+        if (result)
+        {
+            return -1;
+        }
+    }
     return 0;
 }

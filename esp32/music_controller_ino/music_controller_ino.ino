@@ -1,27 +1,20 @@
-#include "timer_types.h"
+#include <Arduino.h>
 #include <Network.h>
-
-extern volatile bool is_wifi_connected;
-
-timer_obj_t timer_obj = {};
+#include "speaker_tasks.h"
+#include "timer_types.h"  // Needed by Arduino's prototypes for legacy timer.ino.
 
 void setup() {
-  if(set_wifi_connection()){
-    is_wifi_connected=true;
-    NetworkClient client;
-    if(set_File_server_connection(&client)){
-      get_files_info(client);
-      if (!init_timer(&timer_obj)) {
-        Serial.println("Timer initialization failed");
-      }
-    }
+  Serial.begin(115200);
+  if (!start_speaker_tasks()) {
+    Serial.println("Failed to start speaker tasks");
+  } else if (!post_speaker_command(SpeakerCommand::Connect)) {
+    // Temporary bring-up path. Move this command to the BLE controller later.
+    Serial.println("Failed to queue initial connect request");
   }
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  if (timer_obj.tickSignal != nullptr &&
-      xSemaphoreTake(timer_obj.tickSignal, 0) == pdTRUE) {
-    Serial.println("1-second timer tick");
-  }
+  // Arduino already runs loop() in a FreeRTOS task. Keep socket, decoder,
+  // and BLE work out of this task; BLE callbacks will enqueue commands.
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }

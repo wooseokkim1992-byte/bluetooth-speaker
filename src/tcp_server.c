@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -50,6 +51,8 @@ static int8_t get_broadcast_position(uint64_t *live_pts_ms,
                                      uint8_t *stream_state);
 static void print_client_data(const client_t *cli);
 static void print_sp_header(const SpHeader *header);
+static void print_sp_payload(const SpHeader *header, const char *frame,
+                             size_t frame_size);
 static void *TCP_control_thread(void *param)
 {
     TCP_control_thread_params_t *data = (TCP_control_thread_params_t *)param;
@@ -247,9 +250,9 @@ int tcp_server_update_broadcast(const SpNowPlaying *track,
                                 uint64_t live_pts_ms, uint8_t stream_state)
 {
     if (stream_state > 1 || (stream_state == 1 &&
-        (track == NULL ||
-         track->title_len > sizeof(broadcast_state.title) ||
-         (track->title_len != 0 && track->title_utf8 == NULL))))
+                             (track == NULL ||
+                              track->title_len > sizeof(broadcast_state.title) ||
+                              (track->title_len != 0 && track->title_utf8 == NULL))))
     {
         errno = EINVAL;
         return -1;
@@ -526,7 +529,7 @@ static int8_t send_response_frame(const client_t *cli, uint8_t type,
     {
     case SP_CONNECT_ACK:
         encoded = construct_connect_payload(&header, payload,
-                                             frame + SP_HEADER_SIZE, payload_len);
+                                            frame + SP_HEADER_SIZE, payload_len);
         break;
     case SP_PONG:
         encoded = construct_pong_payload(&header, payload,
@@ -542,7 +545,7 @@ static int8_t send_response_frame(const client_t *cli, uint8_t type,
         break;
     case SP_NOW_PLAYING:
         encoded = construct_Now_Playing_payload(&header, payload,
-                                                 frame + SP_HEADER_SIZE, payload_len);
+                                                frame + SP_HEADER_SIZE, payload_len);
         break;
     case SP_DISCONNECT_ACK:
         if (payload_len != 0)
@@ -644,7 +647,7 @@ static int8_t set_and_response(client_t *cli)
     if (parsing_header(&request, cli->h_p_buf, SP_HEADER_SIZE) != 0)
         return -1;
     print_sp_header(&request);
-    if (request.magic != SP_MAGIC || request.version != SP_VERSION ||
+    if (check_magic_num(&request) != 0 || request.version != SP_VERSION ||
         request.flags != 0 || request.request_id == SP_NO_REQUEST ||
         request.payload_len != cli->payload_len ||
         cli->received_byte != SP_HEADER_SIZE + (size_t)request.payload_len)
@@ -652,6 +655,7 @@ static int8_t set_and_response(client_t *cli)
         fprintf(stderr, "invalid request header on fd %d\n", cli->fd);
         return -1;
     }
+    print_sp_payload(&request, cli->h_p_buf, cli->received_byte);
 
     switch (request.type)
     {
@@ -669,6 +673,15 @@ static int8_t set_and_response(client_t *cli)
         if (get_broadcast_position(&live_pts_ms, &stream_state) != 0)
             return -1;
         /* Temporary Base profile until the database is connected. */
+        uint64_t token = connect_req.token;
+        if (!token)
+        {
+            if (generate_token(&token) != 0)
+            {
+                perror("generate_token");
+                return -1;
+            }
+        }
         SpConnectAck ack = {
             .result = 0,
             .plan = 1,
@@ -679,6 +692,7 @@ static int8_t set_and_response(client_t *cli)
             .live_pts_ms = stream_state == 1 ? live_pts_ms : 0,
             .ping_interval_ms = 1000,
             .pong_timeout_ms = 10000,
+            .token = token,
         };
         if (send_response_frame(cli, SP_CONNECT_ACK, request.request_id,
                                 &ack, SP_CONNECT_ACK_PAYLOAD_SIZE) != 0)
@@ -761,27 +775,15 @@ print_client_data(const client_t *cli)
     if (cli == NULL)
         return;
 
-    size_t data_len = cli->received_byte;
-    if (data_len > sizeof(cli->h_p_buf))
-        data_len = sizeof(cli->h_p_buf);
-
-    printf("client_t: fd=%d client_id=%u status=%d "
+    printf("client_t: fd=%d client_id=%" PRIu64 " status=%d "
            "updated_time={sec=%lld,usec=%ld} received_state=%d "
            "received_byte=%zu payload_len=%u\n",
-           cli->fd, (unsigned)cli->client_id, (int)cli->status,
+           cli->fd, cli->client_id, (int)cli->status,
            (long long)cli->updated_time.tv_sec,
            (long)cli->updated_time.tv_usec,
            (int)cli->received_state, cli->received_byte,
            (unsigned)cli->payload_len);
 
-    printf("h_p_buf (%zu bytes):", data_len);
-    for (size_t i = 0; i < data_len; ++i)
-    {
-        if (i % 16 == 0)
-            printf("\n  %04zx: ", i);
-        printf("%02x ", (unsigned)(unsigned char)cli->h_p_buf[i]);
-    }
-    putchar('\n');
     fflush(stdout);
 }
 
@@ -795,5 +797,31 @@ static void print_sp_header(const SpHeader *header)
            (unsigned)header->magic, (unsigned)header->version,
            (unsigned)header->type, (unsigned)header->flags,
            (unsigned)header->request_id, (unsigned)header->payload_len);
+    fflush(stdout);
+}
+
+static void print_sp_payload(const SpHeader *header, const char *frame,
+                             size_t frame_size)
+{
+    if (header == NULL || frame == NULL || frame_size < SP_HEADER_SIZE ||
+        header->payload_len > frame_size - SP_HEADER_SIZE)
+        return;
+
+    const uint8_t *payload = (const uint8_t *)frame + SP_HEADER_SIZE;
+    if (header->payload_len == 0)
+    {
+        puts("Payload: none");
+    }
+    else if (header->type == SP_CONNECT_REQ &&
+             header->payload_len == SP_CONNECT_REQ_PAYLOAD_SIZE)
+    {
+        printf("Payload CONNECT_REQ: client_id=%" PRIu64 " token=%s\n",
+               ntoh64(payload), ntoh64(payload + 8) == 0 ? "none" : "<redacted>");
+    }
+    else
+    {
+        printf("Payload: type=0x%02x length=%u (not decoded)\n",
+               (unsigned)header->type, (unsigned)header->payload_len);
+    }
     fflush(stdout);
 }

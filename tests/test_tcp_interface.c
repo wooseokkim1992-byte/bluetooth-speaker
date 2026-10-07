@@ -6,19 +6,35 @@
 
 static void test_header_and_connect_request(void)
 {
-    SpHeader header = {SP_MAGIC, SP_VERSION, SP_CONNECT_REQ, 0, 42, 1};
-    uint8_t frame[SP_HEADER_SIZE + 1] = {0};
+    SpHeader header = {SP_MAGIC, SP_VERSION, SP_CONNECT_REQ, 0, 42,
+                       SP_CONNECT_REQ_PAYLOAD_SIZE};
+    SpConnectRequest request_data = {
+        UINT64_C(0x0102030405060708),
+        UINT64_C(0x1112131415161718),
+    };
+    uint8_t frame[SP_HEADER_SIZE + SP_CONNECT_REQ_PAYLOAD_SIZE] = {0};
     assert(construct_header(&header, (char *)frame, SP_HEADER_SIZE) == 0);
-    frame[SP_HEADER_SIZE] = 0x7a;
+    assert(construct_connect_request_payload(&header, &request_data,
+                                             (char *)frame + SP_HEADER_SIZE,
+                                             SP_CONNECT_REQ_PAYLOAD_SIZE) == 0);
+    const uint8_t expected_payload[SP_CONNECT_REQ_PAYLOAD_SIZE] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x12, 0x13, 0x14,
+        0x15, 0x16, 0x17, 0x18
+    };
+    assert(memcmp(frame + SP_HEADER_SIZE, expected_payload,
+                  sizeof(expected_payload)) == 0);
 
     SpHeader parsed = {0};
     SpConnectRequest request = {0};
     assert(parsing_header(&parsed, (const char *)frame, SP_HEADER_SIZE) == 0);
     assert(parsed.magic == SP_MAGIC && parsed.version == SP_VERSION);
     assert(parsed.type == SP_CONNECT_REQ && parsed.request_id == 42);
-    assert(parsed.payload_len == 1);
+    assert(parsed.payload_len == SP_CONNECT_REQ_PAYLOAD_SIZE);
     assert(parsing_payload_connect_REQ(&parsed, frame, sizeof(frame), &request) == 0);
-    assert(request.client_id_utf8 == 0x7a);
+    assert(request.client_id_utf8 == request_data.client_id_utf8);
+    assert(request.token == request_data.token);
+    assert(parsing_payload_connect_REQ(&parsed, frame, sizeof(frame) - 1,
+                                       &request) == -1);
 }
 
 static void test_connect_ack(void)
@@ -26,10 +42,12 @@ static void test_connect_ack(void)
     SpHeader header = {SP_MAGIC, SP_VERSION, SP_CONNECT_ACK, 0, 42,
                        SP_CONNECT_ACK_PAYLOAD_SIZE};
     SpConnectAck payload = {0, 1, 1, 128000, 44100, 2,
-                            UINT64_C(0x0102030405060708), 1000, 10000};
+                            UINT64_C(0x0102030405060708), 1000, 10000,
+                            UINT64_C(0x1112131415161718)};
     const uint8_t expected[SP_CONNECT_ACK_PAYLOAD_SIZE] = {
         0, 1, 1, 0, 1, 0xf4, 0, 0, 0, 0xac, 0x44, 2,
-        1, 2, 3, 4, 5, 6, 7, 8, 0x03, 0xe8, 0x27, 0x10
+        1, 2, 3, 4, 5, 6, 7, 8, 0x03, 0xe8, 0x27, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18
     };
     uint8_t wire[sizeof(expected)] = {0};
     assert(construct_connect_payload(&header, &payload, (char *)wire,
@@ -88,11 +106,20 @@ static void test_now_playing(void)
                                          sizeof(wire)) == -1);
 }
 
+static void test_generate_token(void)
+{
+    uint64_t token = 0;
+    assert(generate_token(&token) == 0);
+    assert(token != 0);
+    assert(generate_token(NULL) == -1);
+}
+
 int main(void)
 {
     test_header_and_connect_request();
     test_connect_ack();
     test_pong_pause_resume();
     test_now_playing();
+    test_generate_token();
     return 0;
 }
