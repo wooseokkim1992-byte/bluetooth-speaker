@@ -1,97 +1,39 @@
-#define _GNU_SOURCE
 #include "db_internal.h"
-#include <mysql.h>
-#include <ctype.h>
-#include <dirent.h>
-#include <errno.h>
-#include <limits.h>
-#include <math.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
-static int valid_uuid(const char *input, char out[37])
+/* Here "member" means the agreed device/member information query.
+ * Account signup, password verification and sessions are not implemented.
+ */
+DbResult select_member(Db *db, const char *uuid, MemberInfo *out)
 {
-    if (!input || strlen(input) != 36) return 0;
-    for (int i = 0; i < 36; ++i) {
-        unsigned char c = (unsigned char)input[i];
-        if (i == 8 || i == 13 || i == 18 || i == 23) {
-            if (c != '-') return 0;
-        } else if (!isxdigit(c)) return 0;
-        out[i] = (char)tolower(c);
-    }
-    out[36] = '\0';
-    return 1;
-}
-
-static int valid_login_id(const char *login_id)
-{
-    return login_id && *login_id && strlen(login_id) <= 400;
-}
-
-static DbResult read_account(Db *db, AccountInfo *out)
-{
-    MYSQL_RES *result;
-    DbResult status = db_get_result(db, &result);
+    if (!db || !out || !uuid || strlen(uuid) != 36) return db_set_error(db, DB_INVALID_ARGUMENT, "Output required");
+    memset(out, 0, sizeof(*out));
+    char *value = db_text_value(uuid);
+    if (!value) return db_set_error(db, DB_MEMORY_ERROR, "Cannot allocate UUID");
+    DbResult status = db_query(db,
+        "SELECT d.device_uuid,d.member_id,d.plan_name,d.status,p.codec,p.bitrate_bps "
+        "FROM Device d JOIN Plan p ON p.plan_name=d.plan_name WHERE d.device_uuid=%s", value);
+    free(value);
     if (status != DB_OK) return status;
+    MYSQL_RES *result;
+    if ((status = db_get_result(db, &result)) != DB_OK) return status;
     MYSQL_ROW row = mysql_fetch_row(result);
-    if (!row) { mysql_free_result(result); return db_set_error(db, DB_NOT_FOUND, "Member not found"); }
-    int bad = db_copy_text(out->member_uuid, sizeof(out->member_uuid), row[1])
-        || db_copy_text(out->login_id, sizeof(out->login_id), row[2])
-        || db_copy_text(out->password_hash, sizeof(out->password_hash), row[3])
-        || db_copy_text(out->created_at, sizeof(out->created_at), row[4]);
-    out->member_id = (uint64_t)strtoull(row[0], NULL, 10);
+    if (!row) { mysql_free_result(result); return db_set_error(db, DB_NOT_FOUND, "Device/plan not found"); }
+    int bad = db_read_device(row, &out->device)
+        || db_copy_text(out->plan.plan_name, sizeof(out->plan.plan_name), row[2])
+        || db_copy_text(out->plan.codec, sizeof(out->plan.codec), row[4]);
+    out->plan.bitrate_bps = atoi(row[5]);
     mysql_free_result(result);
-    if (bad) { memset(out, 0, sizeof(*out)); return db_set_error(db, DB_DATABASE_ERROR, "Invalid Member data"); }
+    if (bad) return db_set_error(db, DB_DATABASE_ERROR, "Invalid member data");
+
+    /* These values are owned by the running streaming server, not MariaDB. */
+    if (db->runtime.get_member) {
+        MemberRuntime snapshot = {0};
+        if (db->runtime.get_member(db->runtime.context, uuid, &snapshot) == 0) {
+            out->runtime = snapshot;
+            out->runtime_available = 1;
+        }
+    }
     return DB_OK;
 }
-
-DbResult find_member_by_uuid(Db *db, const char *uuid, AccountInfo *out)
-{
-    char normalized[37];
-    if (!out || !valid_uuid(uuid, normalized)) return db_set_error(db, DB_INVALID_ARGUMENT, "Invalid member UUID/output");
-    memset(out, 0, sizeof(*out));
-    DbResult status = db_query(db, "SELECT member_id,member_uuid,login_id,password_hash,created_at "
-                               "FROM Member WHERE member_uuid='%s'", normalized);
-    return status == DB_OK ? read_account(db, out) : status;
-}
-
-DbResult find_member_by_login_id(Db *db, const char *login_id, AccountInfo *out)
-{
-    if (!out || !valid_login_id(login_id)) return db_set_error(db, DB_INVALID_ARGUMENT, "Invalid login ID/output");
-    memset(out, 0, sizeof(*out));
-    char *login = db_text_value(login_id);
-    if (!login) return db_set_error(db, DB_MEMORY_ERROR, "Cannot allocate login ID");
-    DbResult status = db_query(db, "SELECT member_id,member_uuid,login_id,password_hash,created_at "
-                               "FROM Member WHERE login_id=%s", login);
-    free(login);
-    return status == DB_OK ? read_account(db, out) : status;
-}
-
-DbResult insert_member(Db *db, const char *uuid, const char *login_id,
-                       const char *password_hash, uint64_t *member_id)
-{
-    if (member_id) *member_id = 0;
-    char normalized[37];
-    if (!member_id || !valid_uuid(uuid, normalized) || !valid_login_id(login_id)
-            || !password_hash || !*password_hash || strlen(password_hash) > 255)
-        return db_set_error(db, DB_INVALID_ARGUMENT, "Member UUID, login ID, password hash and output required");
-    char *login = db_text_value(login_id), *hash = db_text_value(password_hash);
-    if (!login || !hash) {
-        free(login); free(hash); return db_set_error(db, DB_MEMORY_ERROR, "Cannot allocate member values");
-    }
-    DbResult status = db_query(db, "INSERT INTO Member(member_uuid,login_id,password_hash) "
-                               "VALUES('%s',%s,%s)", normalized, login, hash);
-    free(login); free(hash);
-    if (status == DB_DATABASE_ERROR && mysql_errno(db->connection) == 1062)
-        return db_set_error(db, DB_ALREADY_EXISTS, "Member UUID or login ID already registered");
-    if (status == DB_OK) *member_id = (uint64_t)mysql_insert_id(db->connection);
-    return status;
-}
-

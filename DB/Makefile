@@ -20,4 +20,4 @@ db_core.o db_member.o db_device.o db_song.o: db_internal.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f db_admin $(OBJECTS) db_api.o
+	rm -f db_admin $(OBJECTS)
