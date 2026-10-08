@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -97,6 +98,7 @@ static int8_t set_and_response(client_t *cli, TCP_control_thread_params_t *threa
 static int8_t send_current_now_playing(client_t *cli);
 static int8_t get_broadcast_position(uint64_t *live_pts_ms,
                                      uint8_t *stream_state);
+static int resolve_song_in_files(const char *path, char **out_path);
 static int load_song_pcm(const char *path, uint8_t **out_data, size_t *out_len);
 static int start_audio_stream(audio_stream_t *stream, pthread_t *out_thread,
                               int epoll_fd, const SongInfo *songs,
@@ -417,23 +419,77 @@ int tcp_accept_loop(int serv_sock, int event_fd, pthread_t *out_thread)
     return err;
 }
 
-static int load_song_pcm(const char *path, uint8_t **out_data, size_t *out_len)
+static int resolve_song_in_files(const char *path, char **out_path)
 {
-    if (path == NULL || path[0] == '\0' || out_data == NULL || out_len == NULL)
+    if (path == NULL || path[0] == '\0' || out_path == NULL)
     {
         errno = EINVAL;
         return -1;
     }
+
+    char *files_root = realpath("files", NULL);
+    if (files_root == NULL)
+        return -1;
+    char *resolved_path = realpath(path, NULL);
+    if (resolved_path == NULL)
+    {
+        int error = errno;
+        free(files_root);
+        errno = error;
+        return -1;
+    }
+
+    struct stat file_stat;
+    struct stat root_stat;
+    size_t root_len = strlen(files_root);
+    int error = 0;
+    if (stat(files_root, &root_stat) != 0)
+        error = errno;
+    else if (!S_ISDIR(root_stat.st_mode))
+        error = ENOTDIR;
+    else if (root_len == 1 || strncmp(resolved_path, files_root, root_len) != 0 ||
+             resolved_path[root_len] != '/')
+        error = EACCES;
+    else if (stat(resolved_path, &file_stat) != 0)
+        error = errno;
+    else if (!S_ISREG(file_stat.st_mode))
+        error = EINVAL;
+
+    free(files_root);
+    if (error != 0)
+    {
+        free(resolved_path);
+        errno = error;
+        return -1;
+    }
+    *out_path = resolved_path;
+    return 0;
+}
+
+static int load_song_pcm(const char *path, uint8_t **out_data, size_t *out_len)
+{
+    if (out_data == NULL || out_len == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    char *resolved_path;
+    if (resolve_song_in_files(path, &resolved_path) != 0)
+        return -1;
     size_t capacity = 1024u * 1024u;
     size_t length = 0;
     uint8_t *pcm = malloc(capacity);
     if (pcm == NULL)
+    {
+        free(resolved_path);
         return -1;
+    }
 
     int output_pipe[2];
     if (pipe(output_pipe) != 0)
     {
         free(pcm);
+        free(resolved_path);
         return -1;
     }
     posix_spawn_file_actions_t actions;
@@ -453,11 +509,12 @@ static int load_song_pcm(const char *path, uint8_t **out_data, size_t *out_len)
     {
         char *const args[] = {
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-i", (char *)path, "-f", "s16le", "-acodec", "pcm_s16le",
+            "-i", resolved_path, "-f", "s16le", "-acodec", "pcm_s16le",
             "-ar", "44100", "-ac", "2", "pipe:1", NULL};
         spawn_error = posix_spawnp(&decoder_pid, "ffmpeg", &actions, NULL,
                                    args, environ);
     }
+    free(resolved_path);
     if (actions_initialized)
         posix_spawn_file_actions_destroy(&actions);
     close(output_pipe[1]);
