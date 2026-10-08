@@ -7,6 +7,7 @@ RUN apt-get update \
         build-essential \
         gdb \
         strace \
+        ffmpeg \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/
 

@@ -22,6 +22,12 @@ static void handle_stop(int signo) {
     stop_requested = 1;
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
 static uint32_t next_request_id(uint32_t *next_id) {
     uint32_t id = *next_id;
     *next_id = id + 1;
@@ -74,7 +80,7 @@ static int send_request(int sock, uint8_t type, uint32_t request_id,
 
 int main(int argc, char *argv[]) {
     if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: %s <server IPv4 address> <port number> [client_id 0..255]\n", argv[0]);
+        fprintf(stderr, "usage: %s <server IPv4 address> <port number> [client_id u64]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -86,15 +92,15 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    uint8_t client_id = 1;
+    uint64_t client_id = 1;
     if (argc == 4) {
         errno = 0;
-        unsigned long parsed_id = strtoul(argv[3], &end, 10);
-        if (errno != 0 || end == argv[3] || *end != '\0' || parsed_id > UINT8_MAX) {
+        unsigned long long parsed_id = strtoull(argv[3], &end, 10);
+        if (errno != 0 || end == argv[3] || *end != '\0' || argv[3][0] == '-') {
             fprintf(stderr, "invalid client_id: %s\n", argv[3]);
             return EXIT_FAILURE;
         }
-        client_id = (uint8_t)parsed_id;
+        client_id = (uint64_t)parsed_id;
     }
 
     struct sockaddr_in server_addr = {0};
@@ -137,8 +143,17 @@ int main(int argc, char *argv[]) {
     }
 
     uint32_t request_id = 1;
-    if (send_request(sock, SP_CONNECT_REQ, next_request_id(&request_id),
-                     &client_id, sizeof(client_id)) != 0) {
+    SpConnectRequest connect_req = {.client_id_utf8 = client_id, .token = 0};
+    SpHeader connect_header = {
+        .type = SP_CONNECT_REQ,
+        .payload_len = SP_CONNECT_REQ_PAYLOAD_SIZE,
+    };
+    uint8_t connect_payload[SP_CONNECT_REQ_PAYLOAD_SIZE];
+    if (construct_connect_request_payload(&connect_header, &connect_req,
+                                          (char *)connect_payload,
+                                          sizeof(connect_payload)) != 0 ||
+        send_request(sock, SP_CONNECT_REQ, next_request_id(&request_id),
+                     connect_payload, sizeof(connect_payload)) != 0) {
         perror("CONNECT_REQ");
         close(sock);
         return EXIT_FAILURE;
@@ -151,10 +166,34 @@ int main(int argc, char *argv[]) {
     struct pollfd server = {.fd = sock, .events = POLLIN};
     unsigned char buffer[4096];
     int exit_status = EXIT_SUCCESS;
+    int64_t next_ping_ms = monotonic_ms();
+    if (next_ping_ms < 0) {
+        perror("clock_gettime");
+        close(sock);
+        return EXIT_FAILURE;
+    }
+    next_ping_ms += CLIENT_POLL_TIMEOUT_MS;
 
     while (!stop_requested) {
-        // A finite timeout also covers a signal just before entering poll().
-        int ready = poll(&server, 1, CLIENT_POLL_TIMEOUT_MS);
+        int64_t now_ms = monotonic_ms();
+        if (now_ms < 0) {
+            perror("clock_gettime");
+            exit_status = EXIT_FAILURE;
+            break;
+        }
+        if (now_ms >= next_ping_ms) {
+            if (send_request(sock, SP_PING, next_request_id(&request_id),
+                             NULL, 0) != 0) {
+                perror("PING");
+                exit_status = EXIT_FAILURE;
+                break;
+            }
+            next_ping_ms = now_ms + CLIENT_POLL_TIMEOUT_MS;
+        }
+        // Incoming audio must not postpone the next PING.
+        int timeout_ms = (int)(next_ping_ms - now_ms);
+        if (timeout_ms < 0) timeout_ms = 0;
+        int ready = poll(&server, 1, timeout_ms);
         if (ready < 0) {
             if (errno == EINTR) continue;
             perror("poll");
@@ -162,15 +201,7 @@ int main(int argc, char *argv[]) {
             break;
         }
         if (stop_requested) break;
-        if (ready == 0) {
-            if (send_request(sock, SP_PING, next_request_id(&request_id),
-                             NULL, 0) != 0) {
-                perror("PING");
-                exit_status = EXIT_FAILURE;
-                break;
-            }
-            continue;
-        }
+        if (ready == 0) continue;
 
         if (server.revents & POLLNVAL) {
             fprintf(stderr, "invalid server socket\n");
@@ -197,7 +228,6 @@ int main(int argc, char *argv[]) {
         if (server.revents & (POLLIN | POLLHUP)) {
             ssize_t received = recv(sock, buffer, sizeof(buffer), 0);
             if (received > 0) {
-                // The current server has no application protocol responses yet.
                 printf("received %zd bytes\n", received);
                 fflush(stdout);
             } else if (received == 0) {
