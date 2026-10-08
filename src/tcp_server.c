@@ -31,6 +31,7 @@
 #define DB_PASSWORD "jetson"
 #define DB_PORT 3306
 #define DB_DATABASE "speaker_stream"
+#define DB_SONG_CNT 5
 
 typedef struct _TCP_control_thread_params_t
 {
@@ -40,6 +41,8 @@ typedef struct _TCP_control_thread_params_t
     size_t pcm_len;
     Db *db_handler;
     DbConfig *db_config;
+    SongInfo *song_info;
+    size_t song_cnt;
 } TCP_control_thread_params_t;
 
 typedef struct
@@ -101,6 +104,7 @@ static void print_client_data(const client_t *cli);
 static void print_sp_header(const SpHeader *header);
 static void print_sp_payload(const SpHeader *header, const char *frame,
                              size_t frame_size);
+static int8_t get_songs(TCP_control_thread_params_t *data);
 
 static int8_t init_db(TCP_control_thread_params_t *data)
 {
@@ -135,8 +139,25 @@ static int8_t free_db(TCP_control_thread_params_t *data)
     }
     db_close(data->db_handler);
     data->db_handler = NULL;
+    free(data->song_info);
     free(data->db_config);
+    data->song_info = NULL;
     data->db_config = NULL;
+    return 0;
+}
+
+static int8_t get_songs(TCP_control_thread_params_t *data)
+{
+    if (data->db_handler == NULL)
+    {
+        perror("db handler should be allocated\n");
+        return -1;
+    }
+    if (list_song(data->db_handler, &data->song_info, &data->song_cnt) != DB_OK)
+    {
+        perror("failed to get song list\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -148,6 +169,20 @@ static void *TCP_control_thread(void *param)
     if (init_db(data) < 0)
     {
         return NULL;
+    }
+    if (get_songs(data) != 0)
+    {
+        return NULL;
+    }
+    if (data->song_info == NULL || !data->song_cnt)
+    {
+        perror("no song\n");
+        return NULL;
+    }
+    for (size_t i = 0; i < data->song_cnt; ++i)
+    {
+        printf("%lld | %s | %02lld분 %02lld초\n", data->song_info[i].song_id, data->song_info[i].title,
+               data->song_info[i].duration / 60, data->song_info[i].duration % 60);
     }
     int server_fd = data->server_fd;
     int event_fd = data->event_fd;
