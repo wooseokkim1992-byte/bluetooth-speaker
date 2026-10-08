@@ -9,8 +9,11 @@ RUN apt-get update \
         strace \
         ffmpeg \
         ca-certificates \
+        mysql-server \
+    && apt-get install -y  mariadb-server mariadb-client \
+    && apt-get install -y libmariadb-dev \
     && rm -rf /var/lib/apt/lists/
 
 WORKDIR /app
 
-CMD ["/bin/bash"]
+CMD ["/bin/bash", "-c","service mariadb start && mariadb < ./speaker_stream.sql; exec /bin/bash"]
