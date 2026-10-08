@@ -8,6 +8,8 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include "tcp_interface.h"
+#include "db_internal.h"
+#include "db_api.h"
 
 typedef enum _RECEOVED_STATE
 {

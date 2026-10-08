@@ -26,6 +26,11 @@
 #define AUDIO_CHUNK_BYTES (AUDIO_CHUNK_SAMPLES * PCM_BYTES_PER_SAMPLE_FRAME)
 #define AUDIO_QUEUE_CAPACITY 8u
 #define MAX_DECODED_PCM_BYTES (64u * 1024u * 1024u)
+#define DB_HOST "localhost"
+#define DB_USER "root"
+#define DB_PASSWORD "jetson"
+#define DB_PORT 3306
+#define DB_DATABASE "speaker_stream"
 
 typedef struct _TCP_control_thread_params_t
 {
@@ -33,6 +38,8 @@ typedef struct _TCP_control_thread_params_t
     int event_fd;
     uint8_t *pcm_data;
     size_t pcm_len;
+    Db *db_handler;
+    DbConfig *db_config;
 } TCP_control_thread_params_t;
 
 typedef struct
@@ -76,7 +83,7 @@ static client_t *get_client_data(int fd, client_arr_elem_t *clients);
 static int8_t erase_client_data(int fd, client_arr_elem_t *clients);
 static int8_t init_cli_buf_state(client_t *cli);
 static int8_t scrap_data(int fd, char buf[], size_t buf_size, client_t *cli);
-static int8_t set_and_response(client_t *cli);
+static int8_t set_and_response(client_t *cli, TCP_control_thread_params_t *thread_params);
 static int8_t send_current_now_playing(client_t *cli);
 static int8_t get_broadcast_position(uint64_t *live_pts_ms,
                                      uint8_t *stream_state);
@@ -94,9 +101,54 @@ static void print_client_data(const client_t *cli);
 static void print_sp_header(const SpHeader *header);
 static void print_sp_payload(const SpHeader *header, const char *frame,
                              size_t frame_size);
+
+static int8_t init_db(TCP_control_thread_params_t *data)
+{
+    data->db_config = malloc(sizeof(DbConfig));
+    if (data->db_config == NULL)
+    {
+        perror("error allocate memory\n");
+        return -1;
+    }
+    data->db_config->host = DB_HOST;
+    data->db_config->user = DB_USER;
+    data->db_config->password = DB_PASSWORD;
+    data->db_config->port = DB_PORT;
+    data->db_config->database = DB_DATABASE;
+    DbResult db_result;
+    if ((db_result = db_open(&data->db_handler, data->db_config, NULL)) != 0)
+    {
+        const char *err_msg = db_error(data->db_handler);
+        fprintf(stdout, "db connect result : %d\n", db_result);
+        fprintf(stdout, "db connect result : %s\n", err_msg);
+        perror("error connect Data base server\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int8_t free_db(TCP_control_thread_params_t *data)
+{
+    if (data->db_handler == NULL || data->db_handler)
+    {
+        return -1;
+    }
+    db_close(data->db_handler);
+    data->db_handler = NULL;
+    free(data->db_config);
+    data->db_config = NULL;
+    return 0;
+}
+
 static void *TCP_control_thread(void *param)
 {
+
     TCP_control_thread_params_t *data = (TCP_control_thread_params_t *)param;
+    // data base connection
+    if (init_db(data) < 0)
+    {
+        return NULL;
+    }
     int server_fd = data->server_fd;
     int event_fd = data->event_fd;
     struct sockaddr_in cli_addr_in = {
@@ -226,6 +278,7 @@ static void *TCP_control_thread(void *param)
                     int close_client = 0;
                     if (evt_list[i].events & EPOLLIN)
                     {
+
                         client_t *cli = get_client_data(temp_fd, clients);
                         if (cli == NULL || scrap_data(temp_fd, cli->h_p_buf,
                                                       sizeof(cli->h_p_buf), cli) != 0)
@@ -235,7 +288,7 @@ static void *TCP_control_thread(void *param)
                         else if (cli->received_state == PAYLOAD)
                         {
                             print_client_data(cli);
-                            int8_t result = set_and_response(cli);
+                            int8_t result = set_and_response(cli, data);
                             if (result != 0)
                                 close_client = 1;
                             else if (init_cli_buf_state(cli) != 0)
@@ -261,6 +314,7 @@ static void *TCP_control_thread(void *param)
         }
         stop_audio_stream(&audio_stream, audio_thread);
     }
+    free_db(data);
     close(epoll_fd);
     free(data->pcm_data);
     free(param);
@@ -339,7 +393,8 @@ static int load_demo_pcm(uint8_t **out_data, size_t *out_len)
     /* The input path is fixed; no user-provided text is passed to the shell. */
     FILE *decoder = popen("ffmpeg -nostdin -hide_banner -loglevel error "
                           "-i files/1.mp3 -f s16le -acodec pcm_s16le "
-                          "-ar 44100 -ac 2 pipe:1", "r");
+                          "-ar 44100 -ac 2 pipe:1",
+                          "r");
     if (decoder == NULL)
     {
         free(pcm);
@@ -972,7 +1027,7 @@ static int8_t send_current_now_playing(client_t *cli)
 }
 
 /* 0: keep connection, 1: close after ACK, -1: protocol/I/O error. */
-static int8_t set_and_response(client_t *cli)
+static int8_t set_and_response(client_t *cli, TCP_control_thread_params_t *thread_params)
 {
     if (cli == NULL || cli->received_byte < SP_HEADER_SIZE)
         return -1;
@@ -995,7 +1050,7 @@ static int8_t set_and_response(client_t *cli)
     {
     case SP_CONNECT_REQ:
     {
-        if (cli->status != INIT)
+        if (cli->status != INIT || thread_params->db_handler == NULL)
             return -1;
         SpConnectRequest connect_req;
         if (parsing_payload_connect_REQ(&request, cli->h_p_buf,
@@ -1008,14 +1063,45 @@ static int8_t set_and_response(client_t *cli)
             return -1;
         /* Temporary Base profile until the database is connected. */
         uint64_t token = connect_req.token;
-        if (!token)
+        uint64_t client_id = connect_req.client_id_utf8;
+        fprintf(stdout, "client id : %lu\n", client_id);
+        char client_id_str[21];
+        sprintf(client_id_str, "%lu", client_id);
+        MemberInfo *member_info = malloc(sizeof(MemberInfo));
+        if (member_info == NULL)
         {
-            if (generate_token(&token) != 0)
+            perror("failed to allocate memory");
+            return -1;
+        }
+        DbResult sql_result;
+        sql_result = select_member(thread_params->db_handler, client_id_str, member_info);
+        if (sql_result != 1 && sql_result != 0)
+        {
+            fprintf(stdout, "select member result : %d\n", sql_result);
+            return -1;
+        }
+        if (sql_result == 1 || member_info->device.member_id == 0)
+        {
+            if (!token)
             {
-                perror("generate_token");
+                if (generate_token(&token) != 0)
+                {
+                    perror("generate_token");
+                    return -1;
+                }
+            }
+            sql_result = insert_device(thread_params->db_handler, client_id_str, PLAN_BASE, 1, token);
+            if (sql_result != 0)
+            {
+                perror("insert device info error\n");
                 return -1;
             }
         }
+        else
+        {
+            fprintf(stdout, "device id : %s\n", member_info->device.device_uuid);
+        }
+
         SpConnectAck ack = {
             .result = 0,
             .plan = 1,
@@ -1030,11 +1116,20 @@ static int8_t set_and_response(client_t *cli)
         };
         if (send_response_frame(cli, SP_CONNECT_ACK, request.request_id,
                                 &ack, SP_CONNECT_ACK_PAYLOAD_SIZE) != 0)
+        {
+            free(member_info);
+            member_info = NULL;
             return -1;
+        }
+
         cli->client_id = connect_req.client_id_utf8;
         cli->status = PLAYING;
         if (send_current_now_playing(cli) != 0)
+        {
+            free(member_info);
+            member_info = NULL;
             return -1;
+        }
         break;
     }
     case SP_PING:

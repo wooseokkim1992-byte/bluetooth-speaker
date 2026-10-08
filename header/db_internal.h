@@ -3,13 +3,14 @@
 
 #include "db_api.h"
 #include <mysql.h>
-
-struct Db {
+#define PLAN_BASE "BASE"
+#define PLAN_PREMIUM "PREMIUM"
+struct Db
+{
     MYSQL *connection;
     char error[512];
     DbRuntimeHooks runtime;
 };
-
 DbResult db_set_error(Db *db, DbResult result, const char *format, ...);
 DbResult db_query(Db *db, const char *format, ...);
 DbResult db_get_result(Db *db, MYSQL_RES **out);

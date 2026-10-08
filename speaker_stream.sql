@@ -31,7 +31,7 @@ DROP TABLE IF EXISTS `Device`;
 /*!40101 SET @saved_cs_client     = @@character_set_client */;
 /*!40101 SET character_set_client = utf8 */;
 CREATE TABLE `Device` (
-  `device_uuid` char(36) NOT NULL,
+  `device_uuid` varchar(36) NOT NULL,
   `auth_token_hash` binary(32) DEFAULT NULL,
   `status` varchar(16) NOT NULL,
   `member_id` bigint(20) unsigned DEFAULT NULL,
@@ -77,6 +77,7 @@ CREATE TABLE `Member` (
 
 LOCK TABLES `Member` WRITE;
 /*!40000 ALTER TABLE `Member` DISABLE KEYS */;
+INSERT INTO `Member` VALUES (1,'wskim','12345');
 /*!40000 ALTER TABLE `Member` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -144,4 +145,4 @@ UNLOCK TABLES;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2026-10-08  3:48:11
+-- Dump completed on 2026-10-08 11:47:49

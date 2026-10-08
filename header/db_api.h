@@ -5,44 +5,58 @@
 #include <stdint.h>
 
 typedef struct Db Db;
-typedef enum {
-    DB_OK = 0, DB_NOT_FOUND, DB_ALREADY_EXISTS, DB_ALREADY_PLAN,
-    DB_INVALID_ARGUMENT, DB_DATABASE_ERROR, DB_MEMORY_ERROR, DB_FILE_ERROR
+typedef enum
+{
+    DB_OK = 0,
+    DB_NOT_FOUND,
+    DB_ALREADY_EXISTS,
+    DB_ALREADY_PLAN,
+    DB_INVALID_ARGUMENT,
+    DB_DATABASE_ERROR,
+    DB_MEMORY_ERROR,
+    DB_FILE_ERROR
 } DbResult;
 
-typedef struct {
+typedef struct
+{
     const char *host, *user, *password, *database;
     unsigned int port;
 } DbConfig;
 
-typedef struct {
+typedef struct
+{
     uint64_t member_id; /* member_id=0 means SQL NULL. */
     char device_uuid[37], plan_name[201], status[65];
 } DeviceInfo;
 
-typedef struct {
+typedef struct
+{
     char plan_name[201], codec[65];
     int bitrate_bps;
 } PlanInfo;
 
-typedef struct {
+typedef struct
+{
     char plan_name[201];
     unsigned long long member_count;
 } PlanCount;
 
-typedef struct {
+typedef struct
+{
     long long song_id, duration, file_size_bytes; /* duration: seconds */
     char title[801], file_path[2001], codec[65], checksum_sha256[65];
 } SongInfo;
 
-typedef struct {
+typedef struct
+{
     int connected;
     char playback_state[32];
     long long current_song_id;
     unsigned long long last_played_pts_ms; /* protocol PTS: milliseconds */
 } MemberRuntime;
 
-typedef struct {
+typedef struct
+{
     DeviceInfo device;
     PlanInfo plan;
     int runtime_available;
@@ -53,7 +67,8 @@ typedef struct {
  * 0 = snapshot available, -1 = unavailable. No deletion/locking callbacks.
  * Without this callback only DB information is returned.
  */
-typedef struct {
+typedef struct
+{
     void *context;
     int (*get_member)(void *context, const char *device_uuid, MemberRuntime *out);
 } DbRuntimeHooks;

@@ -4,6 +4,7 @@ AR = ar
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 CPPFLAGS += -Iheader -D_POSIX_C_SOURCE=200809L
 DB_CPPFLAGS += $(shell mariadb_config --cflags)
+DB_CPPFLAGS += -I/usr/include/mariadb
 THREAD_FLAGS = -pthread
 
 BUILD_DIR := build
@@ -55,13 +56,14 @@ $(BUILD_DIR)/libsignal_util.a: $(BUILD_DIR)/signal_util.o
 	$(AR) rcs $@ $^
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) -I/usr/include/mariadb $(CFLAGS) $(THREAD_FLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) -I/usr/include/mariadb $(CFLAGS) $(THREAD_FLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: DB/%.c 
-	$(CC) $(DB_CPPFLAGS) -Iheader -std=c11 -Wall -Wextra -Wpedantic -c $< -o $@
+$(BUILD_DIR)/%.o: DB/%.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(DB_CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) \
+		-MMD -MP -c $< -o $@
 
 $(BUILD_DIR):
 	mkdir -p $@
