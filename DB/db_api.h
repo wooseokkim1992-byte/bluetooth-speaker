@@ -69,7 +69,9 @@ const char *db_result_name(DbResult result);
 /* The nine agreed business APIs. UUID is supplied during device insertion.
  * Member linking/login and token enrollment are outside this package.
  */
-DbResult insert_device(Db *db, const char *device_uuid, const char *plan_name);
+DbResult insert_device(Db *db, const char *device_uuid,
+                       const char *plan_name,
+                       uint64_t member_id, uint64_t auth_token);
 DbResult delete_device(Db *db, const char *device_uuid);
 DbResult update_plan(Db *db, const char *device_uuid, const char *plan_name);
 DbResult select_member(Db *db, const char *device_uuid, MemberInfo *out);

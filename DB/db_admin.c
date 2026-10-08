@@ -9,7 +9,9 @@ static const struct {
     const char *name, *usage;
     int arguments, numeric;
 } commands[] = {
-    {"insert_device", "insert_device UUID BASE|PREMIUM", 2, 0},
+    {"insert_device",
+    "insert_device UUID BASE|PREMIUM MEMBER_ID TOKEN_UINT64",
+    4, 0},
     {"delete_device", "delete_device UUID", 1, 0},
     {"update_plan", "update_plan UUID BASE|PREMIUM", 2, 0},
     {"select_member", "select_member UUID", 1, 0},
@@ -70,7 +72,20 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: %s\n", db_result_name(result), db_error(db)); db_close(db); return 1;
     }
     switch (selected) {
-    case 0: result = insert_device(db, argv[2], argv[3]); break;
+    case 0: {
+    uint64_t member_id;
+    uint64_t auth_token;
+
+    if (!number(argv[4], &member_id) || !member_id
+            || !number(argv[5], &auth_token) || !auth_token) {
+        result = DB_INVALID_ARGUMENT;
+        break;
+    }
+
+    result = insert_device(db, argv[2], argv[3],
+                           member_id, auth_token);
+    break;
+}
     case 1: result = delete_device(db, argv[2]); break;
     case 2: result = update_plan(db, argv[2], argv[3]); break;
     case 3: {

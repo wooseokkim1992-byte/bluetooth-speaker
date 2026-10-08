@@ -13,26 +13,67 @@ int db_read_device(MYSQL_ROW row, DeviceInfo *out)
         || db_copy_text(out->status, sizeof(out->status), row[3]);
 }
 
-DbResult insert_device(Db *db, const char *uuid, const char *plan_name)
+DbResult insert_device(Db *db, const char *uuid,
+                       const char *plan_name,
+                       uint64_t member_id, uint64_t auth_token)
 {
-    if (!db || !uuid || strlen(uuid) != 36 || !plan_name || !*plan_name || strlen(plan_name) > 200)
-        return db_set_error(db, DB_INVALID_ARGUMENT, "Device UUID and plan name required");
+    if (!db || !uuid || strlen(uuid) != 36
+            || !plan_name || !*plan_name || strlen(plan_name) > 200
+            || !member_id || !auth_token)
+        return db_set_error(db, DB_INVALID_ARGUMENT,
+                            "UUID, plan, member ID and token required");
+
+    /* UUID 형식 확인 */
     for (size_t i = 0; i < 36; ++i) {
         if (i == 8 || i == 13 || i == 18 || i == 23) {
-            if (uuid[i] != '-') return db_set_error(db, DB_INVALID_ARGUMENT, "Invalid UUID");
-        } else if (!isxdigit((unsigned char)uuid[i]))
-            return db_set_error(db, DB_INVALID_ARGUMENT, "Invalid UUID");
+            if (uuid[i] != '-')
+                return db_set_error(db, DB_INVALID_ARGUMENT,
+                                    "Invalid UUID");
+        } else if (!isxdigit((unsigned char)uuid[i])) {
+            return db_set_error(db, DB_INVALID_ARGUMENT,
+                                "Invalid UUID");
+        }
     }
-    char *u = db_text_value(uuid), *p = db_text_value(plan_name);
-    if (!u || !p) { free(u); free(p); return db_set_error(db, DB_MEMORY_ERROR, "Cannot allocate values"); }
-    DbResult status = db_query(db,
-        "INSERT INTO Device(device_uuid,plan_name,status) VALUES(%s,%s,'ACTIVE')", u, p);
-    free(u); free(p);
-    if (status == DB_DATABASE_ERROR && mysql_errno(db->connection) == 1062)
-        return db_set_error(db, DB_ALREADY_EXISTS, "Device UUID already registered");
-    if (status == DB_DATABASE_ERROR && mysql_errno(db->connection) == 1452)
-        return db_set_error(db, DB_NOT_FOUND, "Plan not found");
-    return status;
+
+    char *u = db_text_value(uuid);
+    char *p = db_text_value(plan_name);
+
+    if (!u || !p) {
+        free(u);
+        free(p);
+        return db_set_error(db, DB_MEMORY_ERROR,
+                            "Cannot allocate values");
+    }
+
+    /* 8바이트 토큰을 16자리 HEX로 표현 */
+    char token_hex[17];
+    snprintf(token_hex, sizeof(token_hex),
+             "%016llx", (unsigned long long)auth_token);
+
+    /* 토큰 원문 대신 SHA-256 해시 32바이트 저장 */
+    DbResult result = db_query(db,
+        "INSERT INTO Device"
+        "(device_uuid, plan_name, status, member_id, auth_token_hash) "
+        "VALUES(%s, %s, 'ACTIVE', %llu, "
+        "UNHEX(SHA2(UNHEX('%s'), 256)))",
+        u, p, (unsigned long long)member_id, token_hex);
+
+    free(u);
+    free(p);
+
+    if (result == DB_DATABASE_ERROR) {
+        unsigned int error = mysql_errno(db->connection);
+
+        if (error == 1062)
+            return db_set_error(db, DB_ALREADY_EXISTS,
+                                "Device already registered");
+
+        if (error == 1452)
+            return db_set_error(db, DB_NOT_FOUND,
+                                "Member or Plan not found");
+    }
+
+    return result;
 }
 
 DbResult delete_device(Db *db, const char *uuid)
