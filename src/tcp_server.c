@@ -6,12 +6,14 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -31,14 +33,13 @@
 #define DB_PASSWORD "jetson"
 #define DB_PORT 3306
 #define DB_DATABASE "speaker_stream"
-#define DB_SONG_CNT 5
+
+extern char **environ;
 
 typedef struct _TCP_control_thread_params_t
 {
     int server_fd;
     int event_fd;
-    uint8_t *pcm_data;
-    size_t pcm_len;
     Db *db_handler;
     DbConfig *db_config;
     SongInfo *song_info;
@@ -48,6 +49,8 @@ typedef struct _TCP_control_thread_params_t
 typedef struct
 {
     uint64_t pts_ms;
+    size_t song_index;
+    uint32_t data_len;
     uint8_t bytes[AUDIO_CHUNK_BYTES];
 } audio_chunk_t;
 
@@ -56,7 +59,11 @@ typedef struct
     int wake_fd;
     pthread_mutex_t mutex;
     atomic_bool stop;
-    const uint8_t *pcm_data;
+    atomic_bool finished;
+    const SongInfo *songs;
+    size_t song_cnt;
+    size_t song_index;
+    uint8_t *pcm_data;
     size_t pcm_len;
     size_t pcm_offset;
     uint64_t emitted_samples;
@@ -90,10 +97,10 @@ static int8_t set_and_response(client_t *cli, TCP_control_thread_params_t *threa
 static int8_t send_current_now_playing(client_t *cli);
 static int8_t get_broadcast_position(uint64_t *live_pts_ms,
                                      uint8_t *stream_state);
-static int load_demo_pcm(uint8_t **out_data, size_t *out_len);
+static int load_song_pcm(const char *path, uint8_t **out_data, size_t *out_len);
 static int start_audio_stream(audio_stream_t *stream, pthread_t *out_thread,
-                              int epoll_fd, const uint8_t *pcm_data,
-                              size_t pcm_len);
+                              int epoll_fd, const SongInfo *songs,
+                              size_t song_cnt);
 static void stop_audio_stream(audio_stream_t *stream, pthread_t thread);
 static void *audio_producer_thread(void *arg);
 static void dispatch_audio_chunks(audio_stream_t *stream, int epoll_fd);
@@ -131,19 +138,14 @@ static int8_t init_db(TCP_control_thread_params_t *data)
     return 0;
 }
 
-static int8_t free_db(TCP_control_thread_params_t *data)
+static void free_db(TCP_control_thread_params_t *data)
 {
-    if (data->db_handler == NULL || data->db_handler)
-    {
-        return -1;
-    }
     db_close(data->db_handler);
     data->db_handler = NULL;
     free(data->song_info);
     free(data->db_config);
     data->song_info = NULL;
     data->db_config = NULL;
-    return 0;
 }
 
 static int8_t get_songs(TCP_control_thread_params_t *data)
@@ -168,15 +170,21 @@ static void *TCP_control_thread(void *param)
     // data base connection
     if (init_db(data) < 0)
     {
+        free_db(data);
+        free(data);
         return NULL;
     }
     if (get_songs(data) != 0)
     {
+        free_db(data);
+        free(data);
         return NULL;
     }
     if (data->song_info == NULL || !data->song_cnt)
     {
-        perror("no song\n");
+        fprintf(stderr, "no songs available for broadcast\n");
+        free_db(data);
+        free(data);
         return NULL;
     }
     for (size_t i = 0; i < data->song_cnt; ++i)
@@ -195,7 +203,7 @@ static void *TCP_control_thread(void *param)
     if (epoll_fd < 0)
     {
         perror("failed to create epoll");
-        free(data->pcm_data);
+        free_db(data);
         free(param);
         return NULL;
     }
@@ -208,7 +216,7 @@ static void *TCP_control_thread(void *param)
         {
             perror("Failed to register epoll.\n");
             close(epoll_fd);
-            free(data->pcm_data);
+            free_db(data);
             free(param);
             data = NULL;
             return NULL;
@@ -220,7 +228,7 @@ static void *TCP_control_thread(void *param)
         {
             perror("Failed to register epoll.\n");
             close(epoll_fd);
-            free(data->pcm_data);
+            free_db(data);
             free(param);
             data = NULL;
             return NULL;
@@ -229,11 +237,11 @@ static void *TCP_control_thread(void *param)
         audio_stream_t audio_stream;
         pthread_t audio_thread;
         if (start_audio_stream(&audio_stream, &audio_thread, epoll_fd,
-                               data->pcm_data, data->pcm_len) != 0)
+                               data->song_info, data->song_cnt) != 0)
         {
             perror("failed to start audio stream");
             close(epoll_fd);
-            free(data->pcm_data);
+            free_db(data);
             free(param);
             return NULL;
         }
@@ -351,7 +359,6 @@ static void *TCP_control_thread(void *param)
     }
     free_db(data);
     close(epoll_fd);
-    free(data->pcm_data);
     free(param);
     data = NULL;
     return NULL;
@@ -394,7 +401,7 @@ int tcp_accept_loop(int serv_sock, int event_fd, pthread_t *out_thread)
         return EINVAL;
     }
     TCP_control_thread_params_t *params;
-    params = malloc(sizeof(TCP_control_thread_params_t));
+    params = calloc(1, sizeof(TCP_control_thread_params_t));
     // 생성한 thread 에 넘기고, 해당 thread 가 종료 되어질 때,free 될 예정.
     if (params == NULL)
     {
@@ -402,37 +409,63 @@ int tcp_accept_loop(int serv_sock, int event_fd, pthread_t *out_thread)
     }
     params->event_fd = event_fd;
     params->server_fd = serv_sock;
-    if (load_demo_pcm(&params->pcm_data, &params->pcm_len) != 0)
-    {
-        int load_error = errno != 0 ? errno : EIO;
-        free(params);
-        return load_error;
-    }
     int err = pthread_create(out_thread, NULL, TCP_control_thread, params);
     if (err != 0)
     {
-        free(params->pcm_data);
         free(params);
     }
     return err;
 }
 
-static int load_demo_pcm(uint8_t **out_data, size_t *out_len)
+static int load_song_pcm(const char *path, uint8_t **out_data, size_t *out_len)
 {
+    if (path == NULL || path[0] == '\0' || out_data == NULL || out_len == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
     size_t capacity = 1024u * 1024u;
     size_t length = 0;
     uint8_t *pcm = malloc(capacity);
     if (pcm == NULL)
         return -1;
 
-    /* The input path is fixed; no user-provided text is passed to the shell. */
-    FILE *decoder = popen("ffmpeg -nostdin -hide_banner -loglevel error "
-                          "-i files/1.mp3 -f s16le -acodec pcm_s16le "
-                          "-ar 44100 -ac 2 pipe:1",
-                          "r");
-    if (decoder == NULL)
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0)
     {
         free(pcm);
+        return -1;
+    }
+    posix_spawn_file_actions_t actions;
+    int spawn_error = posix_spawn_file_actions_init(&actions);
+    int actions_initialized = spawn_error == 0;
+    if (spawn_error == 0)
+    {
+        spawn_error = posix_spawn_file_actions_adddup2(&actions,
+                                                       output_pipe[1], STDOUT_FILENO);
+        if (spawn_error == 0 && output_pipe[0] != STDOUT_FILENO)
+            spawn_error = posix_spawn_file_actions_addclose(&actions, output_pipe[0]);
+        if (spawn_error == 0 && output_pipe[1] != STDOUT_FILENO)
+            spawn_error = posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
+    }
+    pid_t decoder_pid = -1;
+    if (spawn_error == 0)
+    {
+        char *const args[] = {
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", (char *)path, "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", "44100", "-ac", "2", "pipe:1", NULL};
+        spawn_error = posix_spawnp(&decoder_pid, "ffmpeg", &actions, NULL,
+                                   args, environ);
+    }
+    if (actions_initialized)
+        posix_spawn_file_actions_destroy(&actions);
+    close(output_pipe[1]);
+    if (spawn_error != 0)
+    {
+        close(output_pipe[0]);
+        free(pcm);
+        errno = spawn_error;
         return -1;
     }
 
@@ -443,7 +476,16 @@ static int load_demo_pcm(uint8_t **out_data, size_t *out_len)
         {
             if (capacity == MAX_DECODED_PCM_BYTES)
             {
-                failure_errno = EFBIG;
+                uint8_t extra;
+                ssize_t n;
+                do
+                {
+                    n = read(output_pipe[0], &extra, 1);
+                } while (n < 0 && errno == EINTR);
+                if (n > 0)
+                    failure_errno = EFBIG;
+                else if (n < 0)
+                    failure_errno = errno;
                 break;
             }
             size_t new_capacity = capacity * 2;
@@ -458,25 +500,28 @@ static int load_demo_pcm(uint8_t **out_data, size_t *out_len)
             pcm = larger;
             capacity = new_capacity;
         }
-        size_t n = fread(pcm + length, 1, capacity - length, decoder);
-        length += n;
+        ssize_t n = read(output_pipe[0], pcm + length, capacity - length);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n > 0)
+        {
+            length += (size_t)n;
+            continue;
+        }
         if (n == 0)
-        {
-            if (ferror(decoder))
-                failure_errno = EIO;
             break;
-        }
+        failure_errno = errno;
+        break;
     }
-    if (failure_errno != 0)
+    close(output_pipe[0]);
+    int decoder_status = 0;
+    pid_t waited;
+    do
     {
-        uint8_t discard[8192];
-        while (fread(discard, 1, sizeof(discard), decoder) != 0)
-        {
-            /* Drain the decoder pipe before pclose() to avoid blocking it. */
-        }
-    }
-    int decoder_status = pclose(decoder);
-    if (failure_errno != 0 || decoder_status != 0 || length == 0 ||
+        waited = waitpid(decoder_pid, &decoder_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (failure_errno != 0 || waited != decoder_pid ||
+        !WIFEXITED(decoder_status) || WEXITSTATUS(decoder_status) != 0 || length == 0 ||
         length % PCM_BYTES_PER_SAMPLE_FRAME != 0)
     {
         errno = failure_errno != 0 ? failure_errno : EIO;
@@ -486,20 +531,20 @@ static int load_demo_pcm(uint8_t **out_data, size_t *out_len)
 
     *out_data = pcm;
     *out_len = length;
-    fprintf(stdout, "decoded files/1.mp3: %zu PCM bytes, 44.1 kHz stereo\n",
-            length);
+    fprintf(stdout, "decoded %s: %zu PCM bytes, 44.1 kHz stereo\n", path, length);
     return 0;
 }
 
 static int start_audio_stream(audio_stream_t *stream, pthread_t *out_thread,
-                              int epoll_fd, const uint8_t *pcm_data,
-                              size_t pcm_len)
+                              int epoll_fd, const SongInfo *songs,
+                              size_t song_cnt)
 {
     memset(stream, 0, sizeof(*stream));
     stream->wake_fd = -1;
-    stream->pcm_data = pcm_data;
-    stream->pcm_len = pcm_len;
+    stream->songs = songs;
+    stream->song_cnt = song_cnt;
     atomic_init(&stream->stop, 0);
+    atomic_init(&stream->finished, 0);
     int err = pthread_mutex_init(&stream->mutex, NULL);
     if (err != 0)
     {
@@ -548,37 +593,57 @@ static void stop_audio_stream(audio_stream_t *stream, pthread_t thread)
 static void *audio_producer_thread(void *arg)
 {
     audio_stream_t *stream = arg;
-    static const uint8_t title[] = "1.mp3";
-    SpNowPlaying track = {
-        .track_id = 1,
-        .title_len = sizeof(title) - 1,
-        .title_utf8 = title,
-    };
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
-        return NULL;
+    struct timespec song_start = {0};
+    uint64_t song_samples = 0;
+    size_t consecutive_failures = 0;
 
     while (!atomic_load(&stream->stop))
     {
+        if (stream->pcm_data == NULL)
+        {
+            const SongInfo *song = &stream->songs[stream->song_index];
+            if (load_song_pcm(song->file_path, &stream->pcm_data,
+                              &stream->pcm_len) != 0)
+            {
+                fprintf(stderr, "cannot decode song %lld (%s): %s\n",
+                        song->song_id, song->file_path, strerror(errno));
+                stream->song_index = (stream->song_index + 1) % stream->song_cnt;
+                if (++consecutive_failures == stream->song_cnt)
+                {
+                    fprintf(stderr, "no playable songs remain in the DB list\n");
+                    break;
+                }
+                continue;
+            }
+            consecutive_failures = 0;
+            stream->pcm_offset = 0;
+            song_samples = 0;
+            if (clock_gettime(CLOCK_MONOTONIC, &song_start) != 0)
+                break;
+        }
+
+        size_t remaining = stream->pcm_len - stream->pcm_offset;
+        uint32_t chunk_len = remaining < AUDIO_CHUNK_BYTES
+                                 ? (uint32_t)remaining : AUDIO_CHUNK_BYTES;
         audio_chunk_t chunk = {
             .pts_ms = stream->emitted_samples * 1000u / PCM_SAMPLE_RATE,
+            .song_index = stream->song_index,
+            .data_len = chunk_len,
         };
-        size_t copied = 0;
-        while (copied < AUDIO_CHUNK_BYTES)
+        memcpy(chunk.bytes, stream->pcm_data + stream->pcm_offset, chunk_len);
+        stream->pcm_offset += chunk_len;
+        uint64_t chunk_samples = chunk_len / PCM_BYTES_PER_SAMPLE_FRAME;
+        stream->emitted_samples += chunk_samples;
+        song_samples += chunk_samples;
+        if (stream->pcm_offset == stream->pcm_len)
         {
-            size_t remaining = stream->pcm_len - stream->pcm_offset;
-            size_t count = AUDIO_CHUNK_BYTES - copied;
-            if (count > remaining)
-                count = remaining;
-            memcpy(chunk.bytes + copied, stream->pcm_data + stream->pcm_offset,
-                   count);
-            copied += count;
-            stream->pcm_offset = (stream->pcm_offset + count) % stream->pcm_len;
+            free(stream->pcm_data);
+            stream->pcm_data = NULL;
+            stream->pcm_len = 0;
+            stream->pcm_offset = 0;
+            stream->song_index = (stream->song_index + 1) % stream->song_cnt;
         }
-        stream->emitted_samples += AUDIO_CHUNK_SAMPLES;
 
-        if (tcp_server_update_broadcast(&track, chunk.pts_ms, 1) != 0)
-            break;
         pthread_mutex_lock(&stream->mutex);
         if (stream->queue_count == AUDIO_QUEUE_CAPACITY)
         {
@@ -600,7 +665,12 @@ static void *audio_producer_thread(void *arg)
         if (wake < 0 && errno != EAGAIN)
             break;
 
-        deadline.tv_nsec += 20000000L;
+        struct timespec deadline = {
+            .tv_sec = song_start.tv_sec + (time_t)(song_samples / PCM_SAMPLE_RATE),
+            .tv_nsec = song_start.tv_nsec +
+                       (long)((song_samples % PCM_SAMPLE_RATE) *
+                              1000000000u / PCM_SAMPLE_RATE),
+        };
         if (deadline.tv_nsec >= 1000000000L)
         {
             deadline.tv_nsec -= 1000000000L;
@@ -615,7 +685,13 @@ static void *audio_producer_thread(void *arg)
         if (sleep_error != 0 && sleep_error != EINTR)
             break;
     }
-    tcp_server_update_broadcast(NULL, 0, 0);
+    free(stream->pcm_data);
+    stream->pcm_data = NULL;
+    atomic_store(&stream->finished, 1);
+    uint64_t one = 1;
+    while (write(stream->wake_fd, &one, sizeof(one)) < 0 && errno == EINTR)
+    {
+    }
     return NULL;
 }
 
@@ -635,10 +711,22 @@ static void dispatch_audio_chunks(audio_stream_t *stream, int epoll_fd)
         --stream->queue_count;
         pthread_mutex_unlock(&stream->mutex);
 
+        const SongInfo *song = &stream->songs[chunk.song_index];
+        SpNowPlaying track = {
+            .track_id = (uint64_t)song->song_id,
+            .title_len = (uint16_t)strlen(song->title),
+            .title_utf8 = (const uint8_t *)song->title,
+        };
+        if (tcp_server_update_broadcast(&track, chunk.pts_ms, 1) != 0)
+        {
+            perror("failed to update current song");
+            atomic_store(&stream->stop, 1);
+            break;
+        }
         SpAudioData audio = {
             .stream_pts_ms = chunk.pts_ms,
             .data = chunk.bytes,
-            .data_len = AUDIO_CHUNK_BYTES,
+            .data_len = chunk.data_len,
         };
         for (size_t bucket = 0; bucket < CLIENT_BUCKET_COUNT; ++bucket)
         {
@@ -648,10 +736,11 @@ static void dispatch_audio_chunks(audio_stream_t *stream, int epoll_fd)
                 client_t *cli = node->client;
                 int fd = cli->fd;
                 if (cli->status == PLAYING &&
-                    send_response_frame(cli, SP_AUDIO_DATA, SP_NO_REQUEST,
-                                        &audio,
-                                        SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE +
-                                            audio.data_len) != 0)
+                    (send_current_now_playing(cli) != 0 ||
+                     send_response_frame(cli, SP_AUDIO_DATA, SP_NO_REQUEST,
+                                         &audio,
+                                         SP_AUDIO_DATA_FIXED_PAYLOAD_SIZE +
+                                             audio.data_len) != 0))
                 {
                     perror("audio send failed; disconnecting client");
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -664,6 +753,8 @@ static void dispatch_audio_chunks(audio_stream_t *stream, int epoll_fd)
             }
         }
     }
+    if (atomic_load(&stream->finished))
+        tcp_server_update_broadcast(NULL, 0, 0);
 }
 
 int tcp_server_update_broadcast(const SpNowPlaying *track,
