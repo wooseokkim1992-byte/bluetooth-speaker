@@ -681,7 +681,8 @@ static void *audio_producer_thread(void *arg)
 
         size_t remaining = stream->pcm_len - stream->pcm_offset;
         uint32_t chunk_len = remaining < AUDIO_CHUNK_BYTES
-                                 ? (uint32_t)remaining : AUDIO_CHUNK_BYTES;
+                                 ? (uint32_t)remaining
+                                 : AUDIO_CHUNK_BYTES;
         audio_chunk_t chunk = {
             .pts_ms = stream->emitted_samples * 1000u / PCM_SAMPLE_RATE,
             .song_index = stream->song_index,
