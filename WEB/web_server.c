@@ -54,69 +54,64 @@ static DbResult open_web_db(Db **db)
 
 static void session_reply(int fd, Db *db, const WebSession *user, const char *cookie)
 {
-    if (db_query(db, "SELECT 1 FROM Device WHERE member_id=%llu LIMIT 1",
-            (unsigned long long)user->member_id) != DB_OK) {
-        fprintf(stderr, "Device lookup failed: %s\n", db_error(db));
-        message(fd, 503, "기기 등록 상태를 조회할 수 없습니다."); return;
-    }
-    MYSQL_RES *rows = NULL;
-    if (db_get_result(db, &rows) != DB_OK) {
-        message(fd, 503, "기기 등록 상태를 조회할 수 없습니다."); return;
-    }
-    int registered = mysql_num_rows(rows) != 0;
-    mysql_free_result(rows);
+    (void)db;
     char json[256];
-    /* Strings preserve all 64 bits in JavaScript. */
+    /* Every login asks for the client ID; a previously linked device is not proof. */
     snprintf(json, sizeof(json),
-        "{\"message\":\"로그인되었습니다.\",\"member_id\":\"%llu\",\"device_registered\":%s}",
-        (unsigned long long)user->member_id, registered ? "true" : "false");
+        "{\"message\":\"로그인되었습니다. 기기 ID를 확인해주세요.\",\"member_id\":\"%llu\",\"device_registered\":false}",
+        (unsigned long long)user->member_id);
     web_reply(fd, 200, "application/json; charset=utf-8", json, cookie);
 }
 
-static void register_device(int fd, Db *db, const WebSession *user, const char *uuid)
+/* Decimal browser input represents uint64_t, never a JavaScript Number. */
+static int parse_client_id(const char *text, uint64_t *out)
 {
-    size_t length = strlen(uuid);
-    if (!length || length > 36) {
-        message(fd, 400, "device_uuid는 1~36바이트로 입력해주세요."); return;
+    if (!text || !*text || strlen(text) > 20) return -1;
+    uint64_t value = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        if (*p < '0' || *p > '9') return -1;
+        uint64_t digit = *p - '0';
+        if (value > (UINT64_MAX - digit) / 10) return -1;
+        value = value * 10 + digit;
     }
-    for (size_t i = 0; i < length; ++i) {
-        unsigned char c = (unsigned char)uuid[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-              (c >= 'a' && c <= 'z') || c == '-' || c == '_')) {
-            message(fd, 400, "UUID는 영문, 숫자, 하이픈, 밑줄만 사용할 수 있습니다."); return;
-        }
-    }
-    char *value = db_text_value(uuid);
-    if (!value) { message(fd, 503, "메모리가 부족합니다."); return; }
-    DbResult result = db_query(db,
-        "INSERT INTO Device(device_uuid,member_id,plan_name,status) "
-        "VALUES(%s,%llu,'BASE','ACTIVE')", value,
-        (unsigned long long)user->member_id);
-    if (result == DB_OK) {
-        free(value);
-        message(fd, 201, "기기 등록이 완료되었습니다."); return;
-    }
-    unsigned int error = mysql_errno(db->connection);
-    if (error == 1062) {
-        // 같은 회원의 재전송은 성공 처리. 다른 회원/미소유 기기를 가져오지 않는다.
-        result = db_query(db, "SELECT member_id FROM Device WHERE device_uuid=%s", value);
-        free(value);
-        MYSQL_RES *rows = NULL;
-        if (result != DB_OK || db_get_result(db, &rows) != DB_OK) {
-            message(fd, 503, "기기 등록 상태를 확인할 수 없습니다."); return;
-        }
-        MYSQL_ROW row = mysql_fetch_row(rows);
-        int same_member = row && row[0] &&
-            strtoull(row[0], NULL, 10) == user->member_id;
-        mysql_free_result(rows);
-        if (same_member) message(fd, 200, "이미 본인 계정에 등록된 기기입니다.");
-        else message(fd, 409, "이미 등록된 UUID입니다. 다른 UUID를 입력해주세요.");
+    *out = value;
+    return 0;
+}
+
+static void verify_device(int fd, Db *db, const WebSession *user, const char *text)
+{
+    uint64_t client_id;
+    if (parse_client_id(text, &client_id)) {
+        message(fd, 400, "client_id는 0~18446744073709551615 사이의 십진수로 입력해주세요.");
         return;
     }
+    char decimal[21];
+    snprintf(decimal, sizeof(decimal), "%llu", (unsigned long long)client_id);
+    char *value = db_text_value(decimal);
+    if (!value) { message(fd, 503, "메모리가 부족합니다."); return; }
+
+    /* Only an existing, unowned device may be linked. Never create a Device here.
+     * The conditional UPDATE prevents concurrent claims from replacing an owner.
+     * device_uuid retains its existing name and stores canonical decimal text.
+     */
+    DbResult status = db_query(db,
+        "UPDATE Device SET member_id=%llu WHERE device_uuid=%s AND member_id IS NULL",
+        (unsigned long long)user->member_id, value);
+    if (status == DB_OK)
+        status = db_query(db, "SELECT member_id FROM Device WHERE device_uuid=%s", value);
     free(value);
-    fprintf(stderr, "Device registration failed: %s\n", db_error(db));
-    if (error == 1452) message(fd, 503, "회원 정보와 기본 요금제 BASE를 확인해주세요.");
-    else message(fd, 500, "기기 등록에 실패했습니다. 서버 터미널을 확인해주세요.");
+    MYSQL_RES *rows = NULL;
+    if (status != DB_OK || db_get_result(db, &rows) != DB_OK) {
+        fprintf(stderr, "Device verification failed: %s\n", db_error(db));
+        message(fd, 503, "기기 ID를 확인할 수 없습니다."); return;
+    }
+    MYSQL_ROW row = mysql_fetch_row(rows);
+    int found = row != NULL;
+    int owned = row && row[0] && strtoull(row[0], NULL, 10) == user->member_id;
+    mysql_free_result(rows);
+    if (!found) message(fd, 404, "DB에 등록되지 않은 기기 ID입니다.");
+    else if (!owned) message(fd, 409, "다른 회원에게 연결된 기기입니다.");
+    else message(fd, 200, "기기 ID가 일치합니다. 회원 연결이 확인되었습니다.");
 }
 
 static void handle_request(int fd, WebRequest *request)
@@ -150,13 +145,14 @@ static void handle_request(int fd, WebRequest *request)
     }
     int is_signup = !strcmp(request->path, "/api/signup");
     int is_login = !strcmp(request->path, "/api/login");
-    int is_device = !strcmp(request->path, "/api/register-device");
+    int is_device = !strcmp(request->path, "/api/verify-device") ||
+                    !strcmp(request->path, "/api/register-device");
     if (!is_signup && !is_login && !is_device) { message(fd, 404, "API를 찾을 수 없습니다."); return; }
     WebSession owner = {0};
     if (is_device) {
         char token[65];
         if (!web_cookie_token(request->cookie, token) || !web_session_find(token, &owner)) {
-            message(fd, 401, "로그인 후 기기를 등록해주세요."); return;
+            message(fd, 401, "로그인 후 기기 ID를 확인해주세요."); return;
         }
     }
     WebForm form = {0};
@@ -175,7 +171,7 @@ static void handle_request(int fd, WebRequest *request)
         db_close(db); message(fd, 503, "DB에 연결할 수 없습니다."); return;
     }
     if (is_device) {
-        register_device(fd, db, &owner, form.device_uuid);
+        verify_device(fd, db, &owner, form.client_id);
         explicit_bzero(&form, sizeof(form));
         db_close(db);
     } else if (is_signup) {
