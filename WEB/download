@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+*.o
+*.zip
+web_server
+check_ui.cjs
+README.md
+DOCKER_GUIDE.md
