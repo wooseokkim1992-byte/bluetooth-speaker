@@ -74,3 +74,7 @@ bool sp_encode_connect_request(const SpConnectRequest &request,
 // PING has only a 16-byte header and no payload.
 bool sp_encode_ping_request(uint32_t request_id, uint8_t *out,
                             size_t out_size);
+
+// Encodes a header-only PAUSE_REQ, RESUME_REQ or DISCONNECT_REQ.
+bool sp_encode_control_request(SpMessageType type, uint32_t request_id,
+                               uint8_t *out, size_t out_size);

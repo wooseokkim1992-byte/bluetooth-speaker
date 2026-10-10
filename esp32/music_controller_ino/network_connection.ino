@@ -5,7 +5,7 @@
 const char* ssid = "kcci603";
 const char* password = "@kcci603!";
 volatile bool is_wifi_connected=false;
-const char *SERVER_IP = "10.10.16.7";
+const char *SERVER_IP = "10.10.16.97";
 extern const uint16_t SERVER_PORT = 9000;
 
 #define MAX_FILE_NUM 10

@@ -1,6 +1,7 @@
 #include "speaker_tasks.h"
 #include "speaker_protocol.h"
 #include "pcm_ring.h"
+#include "pcm_volume.h"
 
 #include <Network.h>
 #include <WiFi.h>
@@ -63,9 +64,8 @@ constexpr uint32_t kAudioStackBytes = 6144;
 // 44.1 kHz x 16-bit x 2 channels = 176400 bytes/s. A 50 ms poll with the
 // old 8 KiB read cap could not keep up with a raw PCM stream.
 constexpr TickType_t kPollTicks = pdMS_TO_TICKS(10);
-constexpr TickType_t kRetryTicks = pdMS_TO_TICKS(2000);
-constexpr TickType_t kWifiRetryTicks = pdMS_TO_TICKS(5000);
 constexpr TickType_t kConnectAckTimeoutTicks = pdMS_TO_TICKS(5000);
+constexpr int64_t kControlAckTimeoutUs = 5000000;
 constexpr size_t kConnectFrameSize = SP_HEADER_SIZE + SP_CONNECT_REQ_PAYLOAD_SIZE;
 constexpr size_t kNetworkReadChunk = 1024;
 constexpr int kMaxReadChunksPerLoop = 32;
@@ -88,6 +88,16 @@ struct HeartbeatState {
   bool active = false;
 };
 
+struct ControlState {
+  bool paused = false;
+  uint8_t pending_playback_ack_type = 0;
+  uint32_t pending_playback_request_id = SP_NO_REQUEST;
+  int64_t playback_deadline_us = 0;
+  uint32_t pending_disconnect_request_id = SP_NO_REQUEST;
+  int64_t disconnect_deadline_us = 0;
+  bool disconnect_ack_received = false;
+};
+
 QueueHandle_t command_queue = nullptr;
 TaskHandle_t network_task_handle = nullptr;
 TaskHandle_t audio_task_handle = nullptr;
@@ -98,6 +108,7 @@ uint8_t pcm_storage[kPcmRingBytes];
 PcmRingBuffer pcm_ring(pcm_storage, sizeof(pcm_storage));
 bool audio_accepting = false;
 bool audio_primed = false;
+int volume_percent = 50;
 uint32_t audio_generation = 0;
 uint64_t newest_audio_pts_ms = 0;
 uint64_t current_track_id = 0;
@@ -226,10 +237,12 @@ bool save_token(DeviceIdentity &identity, uint64_t token) {
 
 void reset_connection_state(SpResponseFrameReceiver &receiver,
                             uint32_t &pending_connect_request_id,
-                            bool &ack_received, HeartbeatState &heartbeat) {
+                            bool &ack_received, HeartbeatState &heartbeat,
+                            ControlState &control) {
   pending_connect_request_id = SP_NO_REQUEST;
   ack_received = false;
   heartbeat = {};
+  control = {};
   sp_reset_response_frame(receiver);
   set_audio_accepting(false);
   clear_now_playing();
@@ -239,7 +252,8 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
                            uint32_t &pending_connect_request_id,
                            DeviceIdentity &identity, bool &ack_received,
                            bool &should_connect, HeartbeatState &heartbeat,
-                           bool &pcm_profile_supported) {
+                           bool &pcm_profile_supported,
+                           ControlState &control) {
   SpResponsePayload payload{};
   const uint8_t *bytes = receiver.header.payload_len == 0
                              ? nullptr : receiver.payload;
@@ -314,7 +328,8 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
     Serial.printf("PONG received (request_id=%u, stream_state=%u)\n",
                   static_cast<unsigned>(receiver.header.request_id),
                   static_cast<unsigned>(payload.pong.stream_state));
-    set_audio_accepting(pcm_profile_supported &&
+    set_audio_accepting(pcm_profile_supported && !control.paused &&
+                        control.pending_disconnect_request_id == SP_NO_REQUEST &&
                         payload.pong.stream_state == 1);
     return true;
   }
@@ -330,13 +345,57 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
     return false;
   }
 
+  if (receiver.header.type == SP_PAUSE_ACK ||
+      receiver.header.type == SP_RESUME_ACK) {
+    if (receiver.header.request_id != control.pending_playback_request_id ||
+        receiver.header.type != control.pending_playback_ack_type) {
+      Serial.println("Unexpected playback ACK");
+      return false;
+    }
+    control.pending_playback_request_id = SP_NO_REQUEST;
+    control.pending_playback_ack_type = 0;
+    control.playback_deadline_us = 0;
+    if (receiver.header.type == SP_PAUSE_ACK) {
+      if (payload.pause_ack.result != 0) {
+        Serial.println("PAUSE rejected by server");
+        return true;
+      }
+      control.paused = true;
+      set_audio_accepting(false);
+      Serial.println("PAUSE_ACK received");
+    } else {
+      if (payload.resume_ack.result != 0) {
+        Serial.println("RESUME rejected by server");
+        return true;
+      }
+      control.paused = false;
+      set_audio_accepting(pcm_profile_supported &&
+                          control.pending_disconnect_request_id == SP_NO_REQUEST &&
+                          payload.resume_ack.live_pts_ms != 0);
+      Serial.println("RESUME_ACK received");
+    }
+    return true;
+  }
+
+  if (receiver.header.type == SP_DISCONNECT_ACK) {
+    if (control.pending_disconnect_request_id == SP_NO_REQUEST ||
+        receiver.header.request_id != control.pending_disconnect_request_id) {
+      Serial.println("Unexpected DISCONNECT_ACK request_id");
+      return false;
+    }
+    control.disconnect_ack_received = true;
+    Serial.println("DISCONNECT_ACK received");
+    return true;
+  }
+
   if (receiver.header.type == SP_NOW_PLAYING) {
     if (receiver.header.request_id != SP_NO_REQUEST) return false;
     const bool changed = update_now_playing(payload.now_playing);
     if (changed) {
       // A new track must not play PCM left over from the previous track.
       set_audio_accepting(false);
-      set_audio_accepting(pcm_profile_supported);
+      set_audio_accepting(pcm_profile_supported && !control.paused &&
+                          control.pending_disconnect_request_id == SP_NO_REQUEST);
     }
     Serial.printf("NOW_PLAYING track=%llu title_bytes=%u\n",
                   static_cast<unsigned long long>(payload.now_playing.track_id),
@@ -362,7 +421,8 @@ bool receive_available_frames(NetworkClient &client,
                               uint32_t &pending_connect_request_id,
                               DeviceIdentity &identity, bool &ack_received,
                               bool &should_connect, HeartbeatState &heartbeat,
-                              bool &pcm_profile_supported) {
+                              bool &pcm_profile_supported,
+                              ControlState &control) {
   uint8_t incoming[kNetworkReadChunk];
   for (int chunk = 0; chunk < kMaxReadChunksPerLoop; ++chunk) {
     const int available = client.available();
@@ -387,7 +447,8 @@ bool receive_available_frames(NetworkClient &client,
       if (result == SpFrameFeedResult::Complete) {
         if (!handle_response_frame(receiver, pending_connect_request_id,
                                    identity, ack_received, should_connect,
-                                   heartbeat, pcm_profile_supported)) {
+                                   heartbeat, pcm_profile_supported,
+                                   control)) {
           return false;
         }
         sp_reset_response_frame(receiver);
@@ -406,6 +467,7 @@ void audio_task(void *) {
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
     const uint32_t generation = audio_generation;
     const bool accepting = audio_accepting;
+    const int current_volume_percent = volume_percent;
     if (accepting && !audio_primed &&
         pcm_ring.size() >= kPcmPrebufferBytes) {
       audio_primed = true;
@@ -435,6 +497,11 @@ void audio_task(void *) {
     xSemaphoreGive(audio_mutex);
     if (!still_current) continue;
 
+    if (!scale_pcm_s16le(output, read_size, current_volume_percent)) {
+      Serial.println("Invalid PCM volume setting");
+      continue;
+    }
+
     if (!tx_enabled) {
       if (i2s_channel_enable(i2s_tx) != ESP_OK) {
         Serial.println("I2S TX enable failed");
@@ -462,8 +529,9 @@ void audio_task(void *) {
 void network_task(void *) {
   NetworkClient client;
   bool should_connect = false;
-  TickType_t next_attempt = 0;
-  TickType_t next_wifi_attempt = 0;
+  bool tcp_connect_pending = false;
+  bool wifi_connected_once = false;
+  int previous_wifi_status = -1;
   uint32_t request_sequence = 0;
   uint32_t pending_connect_request_id = SP_NO_REQUEST;
   TickType_t connect_ack_deadline = 0;
@@ -471,41 +539,137 @@ void network_task(void *) {
   bool ack_received = false;
   bool pcm_profile_supported = false;
   HeartbeatState heartbeat{};
+  ControlState control{};
   static SpResponseFrameReceiver receiver{};
   sp_reset_response_frame(receiver);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  auto close_connection = [&]() {
+    client.stop();
+    reset_connection_state(receiver, pending_connect_request_id,
+                           ack_received, heartbeat, control);
+  };
+
+  auto stop_session = [&]() {
+    close_connection();
+    should_connect = false;
+    tcp_connect_pending = false;
+  };
+
+  auto send_control_request = [&](SpMessageType type,
+                                  uint32_t &request_id) -> bool {
+    request_id = next_request_id(request_sequence);
+    uint8_t frame[SP_HEADER_SIZE];
+    return sp_encode_control_request(type, request_id, frame, sizeof(frame)) &&
+           write_all(client, frame, sizeof(frame));
+  };
+
+  auto request_disconnect = [&]() {
+    should_connect = false;
+    tcp_connect_pending = false;
+    if (!client.connected() || !ack_received) {
+      close_connection();
+      return;
+    }
+    if (control.pending_disconnect_request_id != SP_NO_REQUEST) return;
+    uint32_t request_id = SP_NO_REQUEST;
+    if (!send_control_request(SP_DISCONNECT_REQ, request_id)) {
+      Serial.println("Failed to send DISCONNECT_REQ");
+      close_connection();
+      return;
+    }
+    control.pending_disconnect_request_id = request_id;
+    control.disconnect_deadline_us = esp_timer_get_time() + kControlAckTimeoutUs;
+    set_audio_accepting(false);
+    Serial.printf("DISCONNECT_REQ sent (request_id=%u)\n",
+                  static_cast<unsigned>(request_id));
+  };
+
+  auto request_playback = [&](bool pause) {
+    if (!client.connected() || !ack_received ||
+        control.pending_disconnect_request_id != SP_NO_REQUEST ||
+        control.pending_playback_request_id != SP_NO_REQUEST ||
+        control.paused == pause) return;
+    uint32_t request_id = SP_NO_REQUEST;
+    const SpMessageType type = pause ? SP_PAUSE_REQ : SP_RESUME_REQ;
+    if (!send_control_request(type, request_id)) {
+      Serial.println("Failed to send playback request");
+      stop_session();
+      return;
+    }
+    control.pending_playback_request_id = request_id;
+    control.pending_playback_ack_type = pause ? SP_PAUSE_ACK : SP_RESUME_ACK;
+    control.playback_deadline_us = esp_timer_get_time() + kControlAckTimeoutUs;
+    Serial.printf("%s sent (request_id=%u)\n",
+                  pause ? "PAUSE_REQ" : "RESUME_REQ",
+                  static_cast<unsigned>(request_id));
+  };
+
+  WiFi.setAutoReconnect(false);
+  if (!WiFi.mode(WIFI_STA)) {
+    Serial.println("WiFi STA mode failed; WiFi will not be retried");
+  } else {
+    WiFi.begin(ssid, password);
+    Serial.println("WiFi connection started once");
+  }
 
   for (;;) {
     SpeakerCommand command;
     while (xQueueReceive(command_queue, &command, 0) == pdTRUE) {
       switch (command) {
         case SpeakerCommand::Connect:
+          if (client.connected() ||
+              pending_connect_request_id != SP_NO_REQUEST || ack_received) {
+            Serial.println("Connect ignored: TCP session already active");
+            break;
+          }
           should_connect = true;
-          next_attempt = 0;
+          tcp_connect_pending = true;
+          Serial.println(WiFi.status() == WL_CONNECTED
+                             ? "TCP connection queued"
+                             : "TCP connection queued; waiting for WiFi");
+          break;
+        case SpeakerCommand::ToggleConnection:
+          if (!should_connect) {
+            should_connect = true;
+            tcp_connect_pending = true;
+            Serial.println(WiFi.status() == WL_CONNECTED
+                               ? "Connection button: TCP connection queued"
+                               : "Connection button: waiting for WiFi");
+          } else {
+            Serial.println("Connection button: disconnect requested");
+            request_disconnect();
+          }
           break;
         case SpeakerCommand::Disconnect:
-          should_connect = false;
-          reset_connection_state(receiver, pending_connect_request_id,
-                                 ack_received, heartbeat);
-          client.stop();
+          request_disconnect();
           break;
         case SpeakerCommand::Pause:
+          request_playback(true);
+          break;
         case SpeakerCommand::Resume:
-          // post_speaker_command() rejects these until protocol integration.
+          request_playback(false);
+          break;
+        case SpeakerCommand::TogglePlayback:
+          request_playback(!control.paused);
           break;
       }
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-      client.stop();
-      reset_connection_state(receiver, pending_connect_request_id,
-                             ack_received, heartbeat);
-      if (next_wifi_attempt == 0 ||
-          static_cast<int32_t>(xTaskGetTickCount() - next_wifi_attempt) >= 0) {
-        WiFi.reconnect();
-        next_wifi_attempt = xTaskGetTickCount() + kWifiRetryTicks;
+    const int wifi_status = static_cast<int>(WiFi.status());
+    if (wifi_status != previous_wifi_status) {
+      Serial.printf("WiFi status=%d\n", wifi_status);
+      previous_wifi_status = wifi_status;
+    }
+    if (wifi_status == WL_CONNECTED && !wifi_connected_once) {
+      wifi_connected_once = true;
+      Serial.printf("WiFi connected: IP=%s\n",
+                    WiFi.localIP().toString().c_str());
+    }
+    if (wifi_status != WL_CONNECTED) {
+      if (client.connected() || pending_connect_request_id != SP_NO_REQUEST ||
+          ack_received) {
+        Serial.println("WiFi lost; TCP stopped without automatic retry");
+        stop_session();
       }
       vTaskDelay(kPollTicks);
       continue;
@@ -515,50 +679,63 @@ void network_task(void *) {
         !receive_available_frames(client, receiver,
                                   pending_connect_request_id, identity,
                                   ack_received, should_connect, heartbeat,
-                                  pcm_profile_supported)) {
-      client.stop();
-      reset_connection_state(receiver, pending_connect_request_id,
-                             ack_received, heartbeat);
-      next_attempt = xTaskGetTickCount() + kRetryTicks;
+                                  pcm_profile_supported, control)) {
+      Serial.println("Server response failed; TCP stopped");
+      stop_session();
+      continue;
+    }
+
+    if (control.disconnect_ack_received) {
+      close_connection();
+      continue;
     }
 
     if (pending_connect_request_id != SP_NO_REQUEST &&
         static_cast<int32_t>(xTaskGetTickCount() - connect_ack_deadline) >= 0) {
       Serial.println("CONNECT_ACK timeout");
-      client.stop();
-      reset_connection_state(receiver, pending_connect_request_id,
-                             ack_received, heartbeat);
-      next_attempt = xTaskGetTickCount() + kRetryTicks;
+      stop_session();
+      continue;
     }
 
     const int64_t now_us = esp_timer_get_time();
+    if (control.pending_playback_request_id != SP_NO_REQUEST &&
+        now_us >= control.playback_deadline_us) {
+      Serial.println("Playback ACK timeout; TCP stopped");
+      stop_session();
+      continue;
+    }
+    if (control.pending_disconnect_request_id != SP_NO_REQUEST &&
+        now_us >= control.disconnect_deadline_us) {
+      Serial.println("DISCONNECT_ACK timeout; closing TCP");
+      stop_session();
+      continue;
+    }
     if (heartbeat.active &&
         heartbeat.pending_ping_request_id != SP_NO_REQUEST &&
         now_us >= heartbeat.pong_deadline_us) {
-      Serial.println("PONG timeout; reconnecting");
-      client.stop();
-      reset_connection_state(receiver, pending_connect_request_id,
-                             ack_received, heartbeat);
-      next_attempt = xTaskGetTickCount() + kRetryTicks;
+      Serial.println("PONG timeout; TCP stopped");
+      stop_session();
+      continue;
     }
 
-    if (!client.connected() && client.available() == 0) {
-      reset_connection_state(receiver, pending_connect_request_id,
-                             ack_received, heartbeat);
+    if (!client.connected() && client.available() == 0 &&
+        (pending_connect_request_id != SP_NO_REQUEST || ack_received)) {
+      Serial.println("TCP disconnected; waiting for button");
+      stop_session();
+      continue;
     }
 
     if (heartbeat.active && client.connected() &&
+        control.pending_disconnect_request_id == SP_NO_REQUEST &&
         heartbeat.pending_ping_request_id == SP_NO_REQUEST &&
         now_us >= heartbeat.next_ping_at_us) {
       const uint32_t request_id = next_request_id(request_sequence);
       uint8_t ping[SP_HEADER_SIZE];
       if (!sp_encode_ping_request(request_id, ping, sizeof(ping)) ||
           !write_all(client, ping, sizeof(ping))) {
-        Serial.println("Failed to send PING; reconnecting");
-        client.stop();
-        reset_connection_state(receiver, pending_connect_request_id,
-                               ack_received, heartbeat);
-        next_attempt = xTaskGetTickCount() + kRetryTicks;
+        Serial.println("Failed to send PING; TCP stopped");
+        stop_session();
+        continue;
       } else {
         const int64_t sent_at_us = esp_timer_get_time();
         heartbeat.pending_ping_request_id = request_id;
@@ -571,16 +748,18 @@ void network_task(void *) {
       }
     }
 
-    if (should_connect && !client.connected() &&
-        (next_attempt == 0 ||
-         static_cast<int32_t>(xTaskGetTickCount() - next_attempt) >= 0)) {
-      client.stop();
+    if (should_connect && tcp_connect_pending && !client.connected()) {
+      tcp_connect_pending = false;
+      close_connection();
       client.setTimeout(1000);
+      Serial.printf("TCP connect attempt: %s:%u\n", SERVER_IP,
+                    static_cast<unsigned>(SERVER_PORT));
       if (client.connect(SERVER_IP, SERVER_PORT)) {
+        Serial.println("TCP socket connected");
         identity = {};
         if (!load_or_create_identity(identity)) {
           Serial.println("Failed to load or save client identity");
-          client.stop();
+          stop_session();
         } else {
           const uint32_t request_id = next_request_id(request_sequence);
           const SpConnectRequest request = {identity.client_id, identity.token};
@@ -589,7 +768,7 @@ void network_task(void *) {
                                          sizeof(frame)) ||
               !write_all(client, frame, sizeof(frame))) {
             Serial.println("Failed to send CONNECT_REQ");
-            client.stop();
+            stop_session();
           } else {
             pending_connect_request_id = request_id;
             connect_ack_deadline = xTaskGetTickCount() + kConnectAckTimeoutTicks;
@@ -597,8 +776,10 @@ void network_task(void *) {
                           static_cast<unsigned>(pending_connect_request_id));
           }
         }
+      } else {
+        Serial.println("TCP connect failed; waiting for button");
+        stop_session();
       }
-      next_attempt = xTaskGetTickCount() + kRetryTicks;
     }
 
     // Polling sleeps between checks; no timer callback touches the socket.
@@ -659,12 +840,16 @@ bool start_speaker_tasks() {
 }
 
 bool post_speaker_command(SpeakerCommand command) {
-  // Never acknowledge a controller request that the firmware would drop.
-  if (command == SpeakerCommand::Pause || command == SpeakerCommand::Resume) {
-    return false;
-  }
   return command_queue != nullptr &&
          xQueueSend(command_queue, &command, 0) == pdTRUE;
+}
+
+bool set_speaker_volume_percent(int percent) {
+  if (audio_mutex == nullptr || percent < 0 || percent > 100) return false;
+  xSemaphoreTake(audio_mutex, portMAX_DELAY);
+  volume_percent = percent;
+  xSemaphoreGive(audio_mutex);
+  return true;
 }
 
 bool get_speaker_now_playing(uint64_t *track_id, char *title,

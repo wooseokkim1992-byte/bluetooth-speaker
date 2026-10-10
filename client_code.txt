@@ -1,0 +1,59 @@
+void loop() {
+    // 1. 주변 BLE 장치 스캔
+    BLEScanResults* results = scanner->start(5, false);
+
+    // 2. Speaker-esp32 찾기
+    BLEAdvertisedDevice* target = nullptr;
+
+    for (int i = 0; i < results->getCount(); i++) {
+        BLEAdvertisedDevice device = results->getDevice(i);
+
+        if (device.haveName() &&
+            device.getName() == "Speaker-esp32") {
+            targetAddress = device.getAddress().toString().c_str();
+            break;
+        }
+    }
+
+    scanner->clearResults();
+
+    if (targetAddress.isEmpty()) {
+        Serial.println("Speaker not found");
+        delay(1000);
+        return;
+    }
+
+    // 3. 여기서 connect() 수행
+    BLEAddress address(targetAddress.c_str());
+
+    Serial.println("Connecting to Speaker...");
+    if (!speaker->connect(address)) {
+        Serial.println("BLE connection failed");
+        delay(1000);
+        return;
+    }
+
+    Serial.println("BLE connected!");
+
+    // 4. 연결 성공 후 서비스 검색
+    auto* services = speaker->getServices();
+
+    if (services == nullptr) {
+        Serial.println("Service map is NULL");
+    } else {
+        Serial.printf("Service count: %u\n",
+                      (unsigned)services->size());
+
+        for (const auto& entry : *services) {
+            Serial.printf("Found UUID: %s\n",
+                          entry.first.c_str());
+        }
+    }
+
+    // 5. 진단 목적으로 한 번만 연결하고 종료
+    while (speaker->isConnected()) {
+        delay(1000);
+    }
+
+    targetAddress = "";
+}
