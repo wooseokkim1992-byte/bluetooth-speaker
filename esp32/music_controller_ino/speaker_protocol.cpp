@@ -95,13 +95,20 @@ bool sp_encode_connect_request(const SpConnectRequest &request,
 
 bool sp_encode_ping_request(uint32_t request_id, uint8_t *out,
                             size_t out_size) {
+  return sp_encode_control_request(SP_PING, request_id, out, out_size);
+}
+
+bool sp_encode_control_request(SpMessageType type, uint32_t request_id,
+                               uint8_t *out, size_t out_size) {
   if (out == nullptr || out_size < SP_HEADER_SIZE ||
-      request_id == SP_NO_REQUEST) {
+      request_id == SP_NO_REQUEST ||
+      (type != SP_PING && type != SP_PAUSE_REQ &&
+       type != SP_RESUME_REQ && type != SP_DISCONNECT_REQ)) {
     return false;
   }
   put_u32_be(out, SP_MAGIC);
   out[4] = SP_VERSION;
-  out[5] = SP_PING;
+  out[5] = static_cast<uint8_t>(type);
   out[6] = 0;
   out[7] = 0;
   put_u32_be(out + 8, request_id);

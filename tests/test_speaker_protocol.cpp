@@ -108,6 +108,26 @@ void test_ping_request_encoding() {
   assert(!sp_encode_ping_request(1, frame, sizeof(frame) - 1));
 }
 
+void test_control_request_encoding() {
+  for (const SpMessageType type : {SP_PAUSE_REQ, SP_RESUME_REQ,
+                                   SP_DISCONNECT_REQ}) {
+    uint8_t frame[SP_HEADER_SIZE] = {};
+    assert(sp_encode_control_request(type, 0x01020304, frame,
+                                     sizeof(frame)));
+    const uint8_t expected[SP_HEADER_SIZE] = {
+        'S', 'P', 'K', '2', SP_VERSION, static_cast<uint8_t>(type), 0, 0,
+        1, 2, 3, 4, 0, 0, 0, 0};
+    for (size_t i = 0; i < sizeof(frame); ++i) {
+      assert(frame[i] == expected[i]);
+    }
+    assert(!sp_encode_control_request(type, SP_NO_REQUEST, frame,
+                                      sizeof(frame)));
+    assert(!sp_encode_control_request(type, 1, frame, sizeof(frame) - 1));
+  }
+  uint8_t frame[SP_HEADER_SIZE] = {};
+  assert(!sp_encode_control_request(SP_AUDIO_DATA, 1, frame, sizeof(frame)));
+}
+
 void test_fragmented_and_coalesced_responses() {
   constexpr size_t kAckFrameSize = SP_HEADER_SIZE + SP_CONNECT_ACK_PAYLOAD_SIZE;
   constexpr size_t kPongFrameSize = SP_HEADER_SIZE + SP_PONG_PAYLOAD_SIZE;
@@ -211,6 +231,7 @@ int main() {
   test_connect_ack();
   test_connect_request_encoding();
   test_ping_request_encoding();
+  test_control_request_encoding();
   test_fragmented_and_coalesced_responses();
   test_other_responses();
 }
