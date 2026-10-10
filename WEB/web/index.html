@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Speaker Stream · 회원</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f5f6f8;color:#202631;font:16px/1.6 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center;padding:24px}
+    main{width:100%;max-width:440px;background:white;padding:32px;border:1px solid #e5e8ee;border-radius:20px;box-shadow:0 12px 40px #20263108}
+    .brand{color:#58729b;font-size:12px;font-weight:700;letter-spacing:2px}h1{font-size:26px;margin:6px 0}p{color:#697486;margin:0 0 24px;font-size:14px}
+    nav{display:flex;gap:8px;margin:24px 0}button{font:inherit;cursor:pointer;border:0;border-radius:10px;padding:12px 16px}nav button{flex:1;background:#f0f2f6;color:#596679}nav button[aria-selected=true]{background:#e5edff;color:#224fa2}
+    label{display:block;font-size:14px;font-weight:600;margin-top:14px}input{display:block;width:100%;padding:12px;border:1px solid #d9dfe8;border-radius:10px;font:inherit;margin-top:6px}input:focus{outline:2px solid #99b5ec;outline-offset:1px}
+    .submit{width:100%;margin-top:24px;background:#285ec5;color:white;font-weight:600}button:disabled{opacity:.6;cursor:wait}.hint{font-size:12px;color:#778293;margin-top:6px}
+    #message{font-size:14px;margin-top:18px;min-height:24px;color:#315da8}#message.error{color:#b32939}[hidden]{display:none!important}dl{background:#f5f7fb;padding:16px;border-radius:12px}dt{color:#697486;font-size:12px}dd{margin:0 0 12px;overflow-wrap:anywhere;font-family:monospace}
+  </style>
+</head>
+<body>
+<main>
+  <div class="brand">SPEAKER STREAM</div>
+  <h1 id="heading">로그인</h1>
+  <p>계정으로 스피커 서비스를 시작하세요.</p>
+  <section id="forms">
+    <nav aria-label="계정 메뉴"><button id="login-tab" type="button" aria-selected="true">로그인</button><button id="signup-tab" type="button" aria-selected="false">회원가입</button></nav>
+    <form id="login-form">
+      <label for="login-id">로그인 ID</label><input id="login-id" name="login_id" autocomplete="username" maxlength="100" required>
+      <label for="login-password">비밀번호</label><input id="login-password" name="password" type="password" autocomplete="current-password" minlength="8" maxlength="128" required>
+      <button class="submit" type="submit">로그인</button>
+    </form>
+    <form id="signup-form" hidden>
+      <label for="signup-id">로그인 ID</label><input id="signup-id" name="login_id" autocomplete="username" maxlength="100" pattern="[A-Za-z0-9_.\-]+" required>
+      <div class="hint">영문, 숫자, 점, 밑줄, 하이픈을 사용할 수 있어요.</div>
+      <label for="signup-password">비밀번호</label><input id="signup-password" name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+      <div class="hint">8~128바이트로 입력해주세요.</div>
+      <label for="signup-confirm">비밀번호 확인</label><input id="signup-confirm" name="confirm" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+      <button class="submit" type="submit">회원가입</button>
+    </form>
+  </section>
+  <section id="account" hidden>
+    <dl><dt>회원 번호</dt><dd id="member-id"></dd></dl>
+    <form id="device-form" hidden>
+      <p>사용할 스피커의 device_uuid를 입력하면 등록이 완료됩니다.</p>
+      <label for="device-uuid">기기 UUID</label>
+      <input id="device-uuid" name="device_uuid" minlength="1" maxlength="36"
+             pattern="[A-Za-z0-9_\-]+" autocomplete="off" required>
+      <div class="hint">기기에 설정된 UUID를 입력하세요. 영문·숫자·하이픈·밑줄 1~36자.</div>
+      <button class="submit" type="submit">기기 등록 완료</button>
+    </form>
+    <p id="device-complete" hidden>이 계정에 기기가 등록되어 있습니다.</p>
+    <button id="logout" class="submit" type="button">로그아웃</button>
+  </section>
+  <div id="message" role="status" aria-live="polite"></div>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  function notice(text, error=false){$('message').textContent=text;$('message').classList.toggle('error',error);}
+  function tab(signup){$('login-form').hidden=signup;$('signup-form').hidden=!signup;$('heading').textContent=signup?'회원가입':'로그인';$('login-tab').setAttribute('aria-selected',String(!signup));$('signup-tab').setAttribute('aria-selected',String(signup));}
+  function account(data){$('forms').hidden=true;$('account').hidden=false;$('heading').textContent=data.device_registered?'로그인 완료':'기기 등록';$('member-id').textContent=data.member_id;$('device-form').hidden=data.device_registered;$('device-complete').hidden=!data.device_registered;}
+  async function post(path,values){const response=await fetch(path,{method:'POST',credentials:'same-origin',body:new URLSearchParams(values)});const data=await response.json();if(!response.ok)throw new Error(data.message||'요청에 실패했습니다.');return data;}
+  $('login-tab').onclick=()=>{tab(false);notice('');};$('signup-tab').onclick=()=>{tab(true);notice('');};
+  for(const id of ['signup-form','login-form']){$(id).onsubmit=async event=>{event.preventDefault();const form=$(id),button=form.querySelector('button[type=submit]'),values=new FormData(form);if(id==='signup-form'&&values.get('password')!==values.get('confirm')){notice('비밀번호 확인이 일치하지 않습니다.',true);return;}button.disabled=true;notice('처리 중입니다…');try{const data=await post(id==='signup-form'?'/api/signup':'/api/login',values);if(id==='signup-form'){$('login-id').value=values.get('login_id');form.reset();tab(false);}else{form.reset();account(data);}notice(data.message);}catch(error){notice(error.message,true);}finally{button.disabled=false;}};}
+  $('device-form').onsubmit=async event=>{
+    event.preventDefault();
+    const form=$('device-form'),button=form.querySelector('button[type=submit]');
+    button.disabled=true;notice('기기를 등록하고 있습니다…');
+    try{
+      const data=await post('/api/register-device',new FormData(form));
+      account({member_id:$('member-id').textContent,device_registered:true});
+      form.reset();notice(data.message);
+    }catch(error){notice(error.message,true);}finally{button.disabled=false;}
+  };
+  $('logout').onclick=async()=>{const button=$('logout');button.disabled=true;try{const data=await post('/api/logout',{});$('forms').hidden=false;$('account').hidden=true;tab(false);notice(data.message);}catch(error){notice(error.message,true);}finally{button.disabled=false;}};
+  fetch('/api/session',{credentials:'same-origin'}).then(async response=>{if(response.ok){account(await response.json());notice('로그인 상태를 불러왔습니다.');}}).catch(()=>notice('서버 연결을 확인해주세요.',true));
+</script>
+</body>
+</html>
