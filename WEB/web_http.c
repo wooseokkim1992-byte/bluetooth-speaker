@@ -134,13 +134,14 @@ int web_parse_form(const WebRequest *request, WebForm *out)
         if (!strcmp(key, "login_id")) { destination = out->login_id; capacity = sizeof(out->login_id); bit = 1; }
         else if (!strcmp(key, "password")) { destination = out->password; capacity = sizeof(out->password); bit = 2; }
         else if (!strcmp(key, "confirm")) { destination = out->confirm; capacity = sizeof(out->confirm); bit = 4; }
-        else if (!strcmp(key, "device_uuid")) { destination = out->device_uuid; capacity = sizeof(out->device_uuid); bit = 8; }
+        else if ((!strcmp(key, "client_id") || !strcmp(key, "device_uuid"))) { destination = out->client_id; capacity = sizeof(out->client_id); bit = 8; }
         else { bad = 1; break; }
         if ((seen & bit) || decode(equals, destination, capacity)) { bad = 1; break; }
         seen |= bit;
     }
     explicit_bzero(body, sizeof(body));
-    if (!strcmp(request->path, "/api/register-device"))
+    if (!strcmp(request->path, "/api/verify-device") ||
+            !strcmp(request->path, "/api/register-device"))
         return bad || seen != 8 ? -1 : 0;
     return bad || (seen & 3) != 3 || (seen & 8) ? -1 : 0;
 }

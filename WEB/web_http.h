@@ -11,7 +11,7 @@ typedef struct {
 } WebRequest;
 typedef struct {
     char login_id[401], password[513], confirm[513];
-    char device_uuid[37];
+    char client_id[21];
 } WebForm;
 
 /* 0 on success, HTTP error code on malformed/oversized/incomplete input. */

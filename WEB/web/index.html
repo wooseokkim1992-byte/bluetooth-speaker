@@ -39,10 +39,14 @@
     <dl><dt>회원 번호</dt><dd id="member-id"></dd></dl>
     <form id="device-form" hidden>
       <p>사용할 스피커의 device_uuid를 입력하면 등록이 완료됩니다.</p>
-      <label for="device-uuid">기기 UUID</label>
-      <input id="device-uuid" name="device_uuid" minlength="1" maxlength="36"
-             pattern="[A-Za-z0-9_\-]+" autocomplete="off" required>
-      <div class="hint">기기에 설정된 UUID를 입력하세요. 영문·숫자·하이픈·밑줄 1~36자.</div>
+      <label for="device-uuid">기기 ID (client_id)</label>
+<input id="device-uuid" name="client_id"
+       type="text" inputmode="numeric"
+       minlength="1" maxlength="20"
+       pattern="[0-9]+" autocomplete="off" required>
+<div class="hint">
+  기기에 표시된 숫자 ID를 입력하세요. 숫자만 1~20자리.
+</div>
       <button class="submit" type="submit">기기 등록 완료</button>
     </form>
     <p id="device-complete" hidden>이 계정에 기기가 등록되어 있습니다.</p>
