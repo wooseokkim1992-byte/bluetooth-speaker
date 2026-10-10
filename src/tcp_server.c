@@ -29,7 +29,7 @@
 #define AUDIO_CHUNK_BYTES (AUDIO_CHUNK_SAMPLES * PCM_BYTES_PER_SAMPLE_FRAME)
 #define AUDIO_QUEUE_CAPACITY 8u
 #define MAX_DECODED_PCM_BYTES (64u * 1024u * 1024u)
-#define DB_HOST "localhost"
+#define DB_HOST "10.10.16.92"
 #define DB_USER "root"
 #define DB_PASSWORD "jetson"
 #define DB_PORT 3306
@@ -1259,13 +1259,14 @@ static int8_t set_and_response(client_t *cli, TCP_control_thread_params_t *threa
         }
         DbResult sql_result;
         sql_result = select_member(thread_params->db_handler, client_id_str, member_info);
-        if (sql_result != 1 && sql_result != 0)
+        if (sql_result != 0)
         {
             fprintf(stdout, "select member result : %d\n", sql_result);
             return -1;
         }
-        if (sql_result == 1 || member_info->device.member_id == 0)
+        if (member_info->device.member_id != 0)
         {
+            fprintf(stdout, "memder id : %lu\n", member_info->device.member_id);
             if (!token)
             {
                 if (generate_token(&token) != 0)
@@ -1274,12 +1275,12 @@ static int8_t set_and_response(client_t *cli, TCP_control_thread_params_t *threa
                     return -1;
                 }
             }
-            sql_result = insert_device(thread_params->db_handler, client_id_str, PLAN_BASE, 1, token);
-            if (sql_result != 0)
-            {
-                perror("insert device info error\n");
-                return -1;
-            }
+            // sql_result = insert_device(thread_params->db_handler, client_id_str, PLAN_BASE, member_info->device.member_id, token);
+            // if (sql_result != 0)
+            // {
+            //     perror("insert device info error\n");
+            //     return -1;
+            // }
         }
         else
         {
