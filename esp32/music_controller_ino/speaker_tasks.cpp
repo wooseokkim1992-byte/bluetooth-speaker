@@ -13,6 +13,7 @@
 #include <esp_timer.h>
 
 #include <cstring>
+#include <atomic>
 
 // Defined in network_connection.ino. Keep credentials/configuration in one
 // place while the existing sketch is migrated to the current wire protocol.
@@ -33,18 +34,34 @@ bool load_or_create_identity(DeviceIdentity &identity) {
       return false;
     }
   } else {
+    uint8_t random_high = 0;
     do {
-      esp_fill_random(&identity.client_id, sizeof(identity.client_id));
-    } while (identity.client_id == 0);
+      esp_fill_random(&random_high, sizeof(random_high));
+    } while (random_high == 0);
+    // Big-endian wire order: highest byte random, lower 7 bytes zero.
+    identity.client_id = static_cast<uint64_t>(random_high) << 56;
 
-    if (prefs.putULong64("client_id", identity.client_id) != 8) {
+    if (prefs.putULong64("client_id", identity.client_id) !=
+        sizeof(identity.client_id)) {
       prefs.end();
       return false;
     }
   }
-
+  Serial.print("client id: ");
+  Serial.println(identity.client_id);
   identity.token = prefs.getULong64("token", 0);
   prefs.end();
+  return true;
+}
+
+bool get_saved_speaker_client_id(uint64_t *client_id) {
+  if (client_id == nullptr) return false;
+  Preferences prefs;
+  if (!prefs.begin("speaker", true)) return false;
+  const uint64_t saved = prefs.getULong64("client_id", 0);
+  prefs.end();
+  if (saved == 0) return false;
+  *client_id = saved;
   return true;
 }
 
@@ -66,6 +83,7 @@ constexpr uint32_t kAudioStackBytes = 6144;
 constexpr TickType_t kPollTicks = pdMS_TO_TICKS(10);
 constexpr TickType_t kConnectAckTimeoutTicks = pdMS_TO_TICKS(5000);
 constexpr int64_t kControlAckTimeoutUs = 5000000;
+constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr size_t kConnectFrameSize = SP_HEADER_SIZE + SP_CONNECT_REQ_PAYLOAD_SIZE;
 constexpr size_t kNetworkReadChunk = 1024;
 constexpr int kMaxReadChunksPerLoop = 32;
@@ -115,6 +133,11 @@ uint64_t current_track_id = 0;
 char current_title[kMaxTitleBytes + 1] = {};
 size_t current_title_len = 0;
 bool now_playing_valid = false;
+std::atomic<SpeakerDisplayState> display_state{SpeakerDisplayState::WifiConnecting};
+
+void set_display_state(SpeakerDisplayState state) {
+  display_state.store(state, std::memory_order_relaxed);
+}
 
 bool init_i2s_tx() {
   i2s_chan_config_t channel_config =
@@ -287,6 +310,7 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
       return false;
     }
     ack_received = true;
+    set_display_state(SpeakerDisplayState::Playing);
     pcm_profile_supported =
         payload.connect_ack.codec == SP_CODEC_PCM_S16LE &&
         payload.connect_ack.sample_rate_hz == kPcmSampleRate &&
@@ -361,6 +385,7 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
         return true;
       }
       control.paused = true;
+      set_display_state(SpeakerDisplayState::Paused);
       set_audio_accepting(false);
       Serial.println("PAUSE_ACK received");
     } else {
@@ -369,6 +394,7 @@ bool handle_response_frame(const SpResponseFrameReceiver &receiver,
         return true;
       }
       control.paused = false;
+      set_display_state(SpeakerDisplayState::Playing);
       set_audio_accepting(pcm_profile_supported &&
                           control.pending_disconnect_request_id == SP_NO_REQUEST &&
                           payload.resume_ack.live_pts_ms != 0);
@@ -553,6 +579,7 @@ void network_task(void *) {
     close_connection();
     should_connect = false;
     tcp_connect_pending = false;
+    set_display_state(SpeakerDisplayState::Disconnected);
   };
 
   auto send_control_request = [&](SpMessageType type,
@@ -568,13 +595,16 @@ void network_task(void *) {
     tcp_connect_pending = false;
     if (!client.connected() || !ack_received) {
       close_connection();
+      set_display_state(SpeakerDisplayState::Disconnected);
       return;
     }
     if (control.pending_disconnect_request_id != SP_NO_REQUEST) return;
+    set_display_state(SpeakerDisplayState::Disconnecting);
     uint32_t request_id = SP_NO_REQUEST;
     if (!send_control_request(SP_DISCONNECT_REQ, request_id)) {
       Serial.println("Failed to send DISCONNECT_REQ");
       close_connection();
+      set_display_state(SpeakerDisplayState::Disconnected);
       return;
     }
     control.pending_disconnect_request_id = request_id;
@@ -605,8 +635,12 @@ void network_task(void *) {
   };
 
   WiFi.setAutoReconnect(false);
-  if (!WiFi.mode(WIFI_STA)) {
+  set_display_state(SpeakerDisplayState::WifiConnecting);
+  const bool wifi_mode_started = WiFi.mode(WIFI_STA);
+  const uint32_t wifi_start_ms = millis();
+  if (!wifi_mode_started) {
     Serial.println("WiFi STA mode failed; WiFi will not be retried");
+    set_display_state(SpeakerDisplayState::WifiError);
   } else {
     WiFi.begin(ssid, password);
     Serial.println("WiFi connection started once");
@@ -624,6 +658,9 @@ void network_task(void *) {
           }
           should_connect = true;
           tcp_connect_pending = true;
+          if (WiFi.status() == WL_CONNECTED) {
+            set_display_state(SpeakerDisplayState::ConnectServer);
+          }
           Serial.println(WiFi.status() == WL_CONNECTED
                              ? "TCP connection queued"
                              : "TCP connection queued; waiting for WiFi");
@@ -632,6 +669,9 @@ void network_task(void *) {
           if (!should_connect) {
             should_connect = true;
             tcp_connect_pending = true;
+            if (WiFi.status() == WL_CONNECTED) {
+              set_display_state(SpeakerDisplayState::ConnectServer);
+            }
             Serial.println(WiFi.status() == WL_CONNECTED
                                ? "Connection button: TCP connection queued"
                                : "Connection button: waiting for WiFi");
@@ -656,6 +696,8 @@ void network_task(void *) {
     }
 
     const int wifi_status = static_cast<int>(WiFi.status());
+    const bool wifi_became_connected =
+        wifi_status == WL_CONNECTED && previous_wifi_status != WL_CONNECTED;
     if (wifi_status != previous_wifi_status) {
       Serial.printf("WiFi status=%d\n", wifi_status);
       previous_wifi_status = wifi_status;
@@ -664,12 +706,26 @@ void network_task(void *) {
       wifi_connected_once = true;
       Serial.printf("WiFi connected: IP=%s\n",
                     WiFi.localIP().toString().c_str());
+      // Make the persistent ID available to the LCD before TCP is connected.
+      DeviceIdentity prepared_identity{};
+      if (!load_or_create_identity(prepared_identity)) {
+        Serial.println("Failed to prepare client ID after WiFi connection");
+      }
+    }
+    if (wifi_became_connected && !ack_received) {
+      set_display_state(SpeakerDisplayState::ConnectServer);
     }
     if (wifi_status != WL_CONNECTED) {
       if (client.connected() || pending_connect_request_id != SP_NO_REQUEST ||
           ack_received) {
         Serial.println("WiFi lost; TCP stopped without automatic retry");
         stop_session();
+      }
+      if (!wifi_mode_started || wifi_connected_once ||
+          wifi_status == WL_CONNECT_FAILED ||
+          wifi_status == WL_NO_SSID_AVAIL ||
+          millis() - wifi_start_ms >= kWifiConnectTimeoutMs) {
+        set_display_state(SpeakerDisplayState::WifiError);
       }
       vTaskDelay(kPollTicks);
       continue;
@@ -687,6 +743,7 @@ void network_task(void *) {
 
     if (control.disconnect_ack_received) {
       close_connection();
+      set_display_state(SpeakerDisplayState::Disconnected);
       continue;
     }
 
@@ -842,6 +899,10 @@ bool start_speaker_tasks() {
 bool post_speaker_command(SpeakerCommand command) {
   return command_queue != nullptr &&
          xQueueSend(command_queue, &command, 0) == pdTRUE;
+}
+
+SpeakerDisplayState get_speaker_display_state() {
+  return display_state.load(std::memory_order_relaxed);
 }
 
 bool set_speaker_volume_percent(int percent) {

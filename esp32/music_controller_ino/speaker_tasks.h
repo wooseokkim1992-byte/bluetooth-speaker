@@ -14,8 +14,19 @@ enum class SpeakerCommand : uint8_t {
   TogglePlayback,
 };
 
+enum class SpeakerDisplayState : uint8_t {
+  WifiConnecting,
+  WifiError,
+  ConnectServer,
+  Playing,
+  Paused,
+  Disconnecting,
+  Disconnected,
+};
+
 bool start_speaker_tasks();
 bool post_speaker_command(SpeakerCommand command);
+SpeakerDisplayState get_speaker_display_state();
 // 0=mute, 100=full volume. Protected by the audio mutex.
 bool set_speaker_volume_percent(int percent);
 
@@ -30,4 +41,6 @@ struct DeviceIdentity {
 };
 
 bool load_or_create_identity(DeviceIdentity &identity);
+// Reads an already-persisted client ID without generating a new one.
+bool get_saved_speaker_client_id(uint64_t *client_id);
 uint32_t next_request_id(uint32_t &sequence);
