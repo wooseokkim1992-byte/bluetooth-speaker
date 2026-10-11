@@ -9,7 +9,6 @@ THREAD_FLAGS = -pthread
 
 BUILD_DIR := build
 SERVER := $(BUILD_DIR)/server
-CLIENT := $(BUILD_DIR)/client
 
 LDLIBS += $(shell mariadb_config --libs) -lm
 
@@ -19,7 +18,7 @@ LIBRARIES := $(BUILD_DIR)/libtcp_server.a \
              $(BUILD_DIR)/libfile_util.a \
              $(BUILD_DIR)/libsignal_util.a \
 			 $(BUILD_DIR)/libdb_admin.a
-OBJECTS := $(BUILD_DIR)/server.o $(BUILD_DIR)/client.o \
+OBJECTS := $(BUILD_DIR)/server.o \
            $(BUILD_DIR)/tcp_server.o $(BUILD_DIR)/tcp_interface.o \
            $(BUILD_DIR)/file_util.o \
            $(BUILD_DIR)/signal_util.o \
@@ -27,17 +26,13 @@ OBJECTS := $(BUILD_DIR)/server.o $(BUILD_DIR)/client.o \
 
 DEPS := $(OBJECTS:.o=.d)
 
-.PHONY: all server client libs clean
-all: server client 
+.PHONY: all server libs clean
+all: server 
 server: $(SERVER)
-client: $(CLIENT)
 libs: $(LIBRARIES)
 
 
 $(SERVER): $(BUILD_DIR)/server.o $(LIBRARIES)
-	$(CC) $(CFLAGS) $(LDFLAGS) $(THREAD_FLAGS) -o $@ $^ $(LDLIBS)
-
-$(CLIENT): $(BUILD_DIR)/client.o $(BUILD_DIR)/libtcp_interface.a
 	$(CC) $(CFLAGS) $(LDFLAGS) $(THREAD_FLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/libdb_admin.a: $(BUILD_DIR)/db_core.o $(BUILD_DIR)/db_member.o $(BUILD_DIR)/db_device.o $(BUILD_DIR)/db_song.o 
@@ -70,6 +65,6 @@ $(BUILD_DIR):
 
 # Remove only known generated files, not the whole directory.
 clean:
-	$(RM) $(SERVER) $(CLIENT) $(OBJECTS) $(DEPS) $(LIBRARIES)
+	$(RM) $(SERVER) $(OBJECTS) $(DEPS) $(LIBRARIES)
 
 -include $(DEPS)
